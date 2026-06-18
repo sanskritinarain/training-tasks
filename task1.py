@@ -1,6 +1,7 @@
 import pymupdf
 import pdfplumber
 import json
+import re
 
 # SCAN OR DIGITAL
 def if_digital(pdf_path):
@@ -16,23 +17,80 @@ def extract_title(pdf_path):
     title = document.metadata.get("title")
     if title:
         return title
-    return document[0].get_text().split("\n")[0]
+    page= document[0]
+    title=[]
+    max_size= None
+    for block in page.get_text("dict")["blocks"]:
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            text = "".join(s["text"] for s in line["spans"]).strip()
+            size = max(s["size"] for s in line["spans"])
 
-# AUTHORS
+            if not text:
+                continue
+
+            if max_size is None:
+                max_size = size
+
+            if max_size - size > 2 or text.endswith("."):
+                return " ".join(title)
+
+            title.append(text)
+
+    return " ".join(title)
+
+
 def extract_authors(pdf_path):
-    document = pymupdf.open(pdf_path)
-    authors = document.metadata.get("author")
-    if authors:
-        return authors.split(", ")
-    return document[0].get_text().split("\n")[1]
+    doc = pymupdf.open(pdf_path)
+
+    if doc.metadata.get("author"):
+        return doc.metadata["author"].split(", ")
+
+    lines = []
+
+    for block in doc[0].get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+
+            text = "".join(span["text"] for span in line["spans"]).strip()
+
+            if text:
+                size = max(span["size"] for span in line["spans"])
+                lines.append((text, size))
+
+    title_size = max(size for _, size in lines)
+
+    author_size = next(
+        size for _, size in lines
+        if size < title_size
+    )
+
+    authors = []
+
+    for text, size in lines:
+        if size == author_size and not any(
+            word in text.lower()
+            for word in ["department", "university", "email", "@"]
+        ):
+            authors.append(text)
+
+    return authors
 
 # TEXT
-def extract_text(pdf_path):
+def extract_text(pdf_path, chunk_size=500):
     document = pymupdf.open(pdf_path)
+
     text = ""
     for page in document:
-        text = text + page.get_text()
-    return text
+        text += page.get_text() + " "
+
+    words = text.split()
+
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+
+    return text, chunks
 
 # WORD COUNT
 def word_count(text):
@@ -69,7 +127,9 @@ page_count  = len(document)
 is_digital  = if_digital(pdf_path)
 title       = extract_title(pdf_path)
 authors     = extract_authors(pdf_path)
-text        = extract_text(pdf_path)
+
+text, chunks = extract_text(pdf_path)
+
 tables      = extract_tables(pdf_path)
 table_count = count_tables(pdf_path)
 figure_count = count_figures(pdf_path)
@@ -89,6 +149,7 @@ pdf_data = {
     "title"        : title,
     "authors"      : authors if isinstance(authors, list) else [authors],
     "word_count"   : word_count(text),
+    "chunks"       : chunks,
     "table_count"  : len(tables),
     "figure_count" : figure_count,
     "text"         : text,
