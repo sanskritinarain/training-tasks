@@ -241,21 +241,7 @@ def chunk_plain_text(page_texts, pdf_path, chunk_size=400, overlap=70):
     return full_text, chunks
 
 
-# TABLE BOXES
 
-def get_table_bboxes(pdf_path):
-    bboxes = {}
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages, start=1):
-                page_bboxes = []
-                for table in page.find_tables():
-                    page_bboxes.append(table.bbox)
-                if page_bboxes:
-                    bboxes[i] = page_bboxes
-    except Exception:
-        pass
-    return bboxes
 
 
 # TITLE
@@ -486,49 +472,108 @@ def word_count(text):
     return len(text.split())
 
 
-# TABLES
+# TABLE DETECTION 
 
-def extract_tables(pdf_path):
-    tables = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_number, page in enumerate(pdf.pages, start=1):
-                table_settings = {
-                    "vertical_strategy": "lines_strict",
-                    "horizontal_strategy": "lines_strict",
-                }
-                found = page.extract_tables(table_settings)
-                
-            
-                if not found:
-                    table_settings = {
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "text",
-                    }
-                    found = page.extract_tables(table_settings)
+TABLE_SETTINGS_LINES = {"vertical_strategy": "lines", "horizontal_strategy": "lines"} 
 
-                for table in found:
-                    if not table:
-                        continue
-                    rows = []
-                    for row in table:
-                        cleaned = [cell.strip() if cell else "" for cell in row]
-                        rows.append(" | ".join(cleaned))
-                    text = "\n".join(rows)
+TABLE_SETTINGS_TEXT  = {"vertical_strategy": "text",  "horizontal_strategy": "text", 
 
-                    tables.append({
-                        "chunk_id": make_chunk_id(pdf_path, text, page_number, page_number),
-                        "text": text,
-                        "word_count": len(text.split()),
-                        "page_start": page_number,
-                        "page_end": page_number,
-                        "section_heading": None,
-                        "type": "table",
-                    })
-    except Exception:
-        pass
-    return tables
+                        "snap_tolerance": 4, "join_tolerance": 4} 
 
+  
+
+def _find_page_tables(page): 
+
+    # ruled tables first; if none, fall back to text-aligned (borderless) 
+
+    tables = page.find_tables(TABLE_SETTINGS_LINES) 
+
+    if not tables: 
+
+        tables = page.find_tables(TABLE_SETTINGS_TEXT) 
+
+    return tables 
+
+  
+
+def _looks_like_table(rows): 
+
+    # guard against the text-strategy turning prose / multi-column text into a "table" 
+
+    if not rows or len(rows) < 2: 
+
+        return False 
+
+    ncols = max(len(r) for r in rows) 
+
+    if ncols < 2: 
+
+        return False 
+
+    filled = sum(1 for r in rows for c in r if c and c.strip()) 
+
+    total  = sum(len(r) for r in rows) or 1 
+
+    return filled / total >= 0.5 
+
+  
+
+def extract_tables_and_bboxes(pdf_path): 
+
+
+    table_chunks, bboxes = [], {} 
+
+    try: 
+
+        with pdfplumber.open(pdf_path) as pdf: 
+
+            for page_number, page in enumerate(pdf.pages, start=1): 
+
+                page_bboxes = [] 
+
+                for t in _find_page_tables(page): 
+
+                    rows = t.extract() 
+
+                    if not _looks_like_table(rows): 
+
+                        continue 
+
+                    page_bboxes.append(t.bbox)          # same table feeds the mask 
+
+                    text = "\n".join( 
+
+                        " | ".join((c or "").strip() for c in row) for row in rows 
+
+                    ) 
+
+                    table_chunks.append({ 
+
+                        "chunk_id": make_chunk_id(pdf_path, text, page_number, page_number), 
+
+                        "text": text, 
+
+                        "word_count": len(text.split()), 
+
+                        "page_start": page_number,       # page link, from same loop 
+
+                        "page_end": page_number, 
+
+                        "section_heading": None, 
+
+                        "type": "table", 
+
+                    }) 
+
+                if page_bboxes: 
+
+                    bboxes[page_number] = page_bboxes 
+
+    except Exception: 
+
+        pass 
+
+    return table_chunks, bboxes 
 
 # FIGURE COUNT
 
@@ -569,11 +614,11 @@ def main(pdf_path: str | None = None) -> dict | None:
         print("pdf has no pages")
         doc.close()
         return None
-
+    
     is_digital   = if_digital(doc)
     title        = extract_title(doc)
     authors      = extract_authors(doc)
-    table_bboxes = get_table_bboxes(pdf_path)
+    table_bboxes, tables = detect_tables(pdf_path) 
 
     ocr_used = False
     if is_digital:
@@ -585,8 +630,9 @@ def main(pdf_path: str | None = None) -> dict | None:
         text, chunks = chunk_plain_text(page_texts, pdf_path, chunk_size=400, overlap=70)
         ocr_used = True
 
-    tables       = extract_tables(pdf_path)     
     figure_count = count_figures(doc)
+
+   
 
     doc.close()
 
