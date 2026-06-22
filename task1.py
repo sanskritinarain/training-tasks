@@ -1,13 +1,12 @@
 import re
-import numpy as np
 import pymupdf
 import pdfplumber
 import json
 import os
 import hashlib
 import pytesseract
-from PIL import Image
 import io
+import sys
 
 
 # SCAN OR DIGITAL
@@ -32,10 +31,9 @@ def if_digital(doc, threshold=0.7):
     return (empty_pages / total_pages) < threshold
 
 
-#OCR
+# OCR
 
 def ocr_extract_text(doc, dpi=300):
-
     page_texts = []
     mat = pymupdf.Matrix(dpi / 72, dpi / 72)
     for i in range(len(doc)):
@@ -50,7 +48,7 @@ def ocr_extract_text(doc, dpi=300):
     return page_texts
 
 
-#TEXT cleaning
+# TEXT NORMALISATION
 
 _LIGATURE_MAP = {
     "\ufb00": "ff",
@@ -84,7 +82,7 @@ def normalize_for_comparison(text):
     return t
 
 
-#HEADER FOOTER STRIP
+# HEADER FOOTER STRIP
 
 def detect_repeated_lines(pages, edge_count=2, min_page_fraction=0.5, min_pages=3):
     total_pages = len(pages)
@@ -202,7 +200,7 @@ def make_chunk_id(pdf_path, chunk_text, page_start, page_end):
     return f"{base}_{digest}"
 
 
-# PLAIN TEXT CHUNKING 
+# PLAIN TEXT CHUNKING
 
 def chunk_plain_text(page_texts, pdf_path, chunk_size=400, overlap=70):
     tagged_words = []
@@ -236,23 +234,23 @@ def chunk_plain_text(page_texts, pdf_path, chunk_size=400, overlap=70):
             "page_start": min(pages),
             "page_end": max(pages),
             "section_heading": None,
+            "type": "text",
         })
         i += step
 
     return full_text, chunks
 
 
-# TABLE BOXES 
+# TABLE BOXES
 
 def get_table_bboxes(pdf_path):
-
     bboxes = {}
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
                 page_bboxes = []
                 for table in page.find_tables():
-                    page_bboxes.append(table.bbox)   # (x0, top, x1, bottom)
+                    page_bboxes.append(table.bbox)
                 if page_bboxes:
                     bboxes[i] = page_bboxes
     except Exception:
@@ -260,7 +258,7 @@ def get_table_bboxes(pdf_path):
     return bboxes
 
 
-#  TITLE
+# TITLE
 
 def extract_title(doc):
     try:
@@ -309,7 +307,7 @@ def extract_title(doc):
         return None
 
 
-# AUTHORS 
+# AUTHORS
 
 def extract_authors(doc):
     try:
@@ -360,7 +358,7 @@ def extract_authors(doc):
         return []
 
 
-# LINE EXTRACTION WITH HEADING DETECTION 
+# LINE EXTRACTION WITH HEADING DETECTION
 
 def extract_lines_with_metadata(doc, table_bboxes=None, body_size_threshold_delta=1.5):
     if table_bboxes is None:
@@ -387,7 +385,6 @@ def extract_lines_with_metadata(doc, table_bboxes=None, body_size_threshold_delt
             if "lines" not in block:
                 continue
 
-        
             bx0, by0, bx1, by1 = block["bbox"]
             in_table = any(
                 tx0 <= bx0 and ty0 <= by0 and bx1 <= tx1 and by1 <= ty1
@@ -419,7 +416,7 @@ def extract_lines_with_metadata(doc, table_bboxes=None, body_size_threshold_delt
     return pages
 
 
-#  WORD EXTRACTION WITH METADATA 
+# WORD EXTRACTION WITH METADATA
 
 def extract_words_with_metadata(doc, table_bboxes=None, body_size_threshold_delta=1.5):
     pages = extract_lines_with_metadata(doc, table_bboxes, body_size_threshold_delta)
@@ -474,6 +471,7 @@ def extract_text(doc, pdf_path, table_bboxes=None, chunk_size=400, overlap=50):
             "page_start": min(pages),
             "page_end": max(pages),
             "section_heading": max(set(headings), key=headings.count) if headings else None,
+            "type": "text",
         }
 
         chunks.append(chunk)
@@ -482,22 +480,38 @@ def extract_text(doc, pdf_path, table_bboxes=None, chunk_size=400, overlap=50):
     return full_text, chunks
 
 
-# WORD COUNT 
+# WORD COUNT
 
 def word_count(text):
     return len(text.split())
 
 
-#  TABLES
+# TABLES
 
 def extract_tables(pdf_path):
     tables = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_tables = page.extract_tables()
-                if page_tables:
-                    tables.extend(page_tables)
+            for page_number, page in enumerate(pdf.pages, start=1):
+                for table in page.extract_tables():
+                    if not table:
+                        continue
+
+                    rows = []
+                    for row in table:
+                        cleaned = [cell.strip() if cell else "" for cell in row]
+                        rows.append(" | ".join(cleaned))
+                    text = "\n".join(rows)
+
+                    tables.append({
+                        "chunk_id": make_chunk_id(pdf_path, text, page_number, page_number),
+                        "text": text,
+                        "word_count": len(text.split()),
+                        "page_start": page_number,
+                        "page_end": page_number,
+                        "section_heading": None,
+                        "type": "table",
+                    })
     except Exception:
         pass
     return tables
@@ -512,32 +526,40 @@ def count_figures(doc):
     return count
 
 
+# MAIN
 
-def main():
-    pdf_path = "multivariate_paper (7).pdf"
+def main(pdf_path: str | None = None) -> dict | None:
+
+    if pdf_path is None:                   
+        if len(sys.argv) < 2:
+            print("usage: python script.py <pdf_path>")
+            return None
+        pdf_path = sys.argv[1]              
+
+    if not os.path.isfile(pdf_path):
+        print(f"File not found: {pdf_path}")
+        return None
 
     try:
         doc = pymupdf.open(pdf_path)
     except Exception as e:
         print(f"Failed to open pdf: {e}")
-        return
-
+        return None
 
     if doc.needs_pass:
         print("pdf has password")
         doc.close()
-        return
+        return None
 
     page_count = len(doc)
     if page_count == 0:
         print("pdf has no pages")
         doc.close()
-        return
+        return None
 
-    is_digital = if_digital(doc)
-    title      = extract_title(doc)
-    authors    = extract_authors(doc)
-
+    is_digital   = if_digital(doc)
+    title        = extract_title(doc)
+    authors      = extract_authors(doc)
     table_bboxes = get_table_bboxes(pdf_path)
 
     ocr_used = False
@@ -550,18 +572,19 @@ def main():
         text, chunks = chunk_plain_text(page_texts, pdf_path, chunk_size=400, overlap=70)
         ocr_used = True
 
-    tables       = extract_tables(pdf_path)
+    tables       = extract_tables(pdf_path)     
     figure_count = count_figures(doc)
 
     doc.close()
 
+    all_chunks = chunks + tables                
     print("Is Digital  :", is_digital)
     print("OCR Used    :", ocr_used)
     print("Page Count  :", page_count)
     print("Title       :", title)
     print("Authors     :", authors)
     print("Word Count  :", word_count(text))
-    print("Chunk Count :", len(chunks))
+    print("Chunk Count :", len(all_chunks))
     print("Figure Count:", figure_count)
 
     pdf_data = {
@@ -571,15 +594,16 @@ def main():
         "title":        title,
         "authors":      authors if isinstance(authors, list) else [authors],
         "word_count":   word_count(text),
-        "chunks":       chunks,
+        "chunks":       all_chunks,            
+        "table_count":  len(tables),            
         "figure_count": figure_count,
-        "tables":       tables,
     }
 
     with open("pdf_output.json", "w", encoding="utf-8") as f:
         json.dump(pdf_data, f, indent=4, ensure_ascii=False)
 
     print("pdf_output.json saved")
+    return pdf_data
 
 
 if __name__ == "__main__":
