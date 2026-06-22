@@ -555,7 +555,7 @@ def extract_tables_and_bboxes(pdf_path):
 
                         "word_count": len(text.split()), 
 
-                        "page_start": page_number,       # page link, from same loop 
+                        "page_start": page_number, 
 
                         "page_end": page_number, 
 
@@ -618,7 +618,7 @@ def main(pdf_path: str | None = None) -> dict | None:
     is_digital   = if_digital(doc)
     title        = extract_title(doc)
     authors      = extract_authors(doc)
-    table_bboxes, tables = detect_tables(pdf_path) 
+    tables, table_bboxes = extract_tables_and_bboxes(pdf_path)
 
     ocr_used = False
     if is_digital:
