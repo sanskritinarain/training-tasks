@@ -493,10 +493,23 @@ def extract_tables(pdf_path):
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
-                for table in page.extract_tables():
+                table_settings = {
+                    "vertical_strategy": "lines_strict",
+                    "horizontal_strategy": "lines_strict",
+                }
+                found = page.extract_tables(table_settings)
+                
+            
+                if not found:
+                    table_settings = {
+                        "vertical_strategy": "text",
+                        "horizontal_strategy": "text",
+                    }
+                    found = page.extract_tables(table_settings)
+
+                for table in found:
                     if not table:
                         continue
-
                     rows = []
                     for row in table:
                         cleaned = [cell.strip() if cell else "" for cell in row]
@@ -608,3 +621,6 @@ def main(pdf_path: str | None = None) -> dict | None:
 
 if __name__ == "__main__":
     main()
+
+
+    
