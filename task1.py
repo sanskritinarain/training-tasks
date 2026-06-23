@@ -7,7 +7,7 @@ import hashlib
 import pytesseract
 import io
 import sys
-
+from collections import defaultdict
 
 # SCAN OR DIGITAL
 
@@ -474,107 +474,199 @@ def word_count(text):
 
 # TABLE DETECTION 
 
-TABLE_SETTINGS_LINES = {"vertical_strategy": "lines", "horizontal_strategy": "lines"} 
 
-TABLE_SETTINGS_TEXT  = {"vertical_strategy": "text",  "horizontal_strategy": "text", 
+TABLE_SETTINGS_LINES = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+TABLE_SETTINGS_TEXT  = {"vertical_strategy": "text", "horizontal_strategy": "text",
+                        "snap_tolerance": 4, "join_tolerance": 4}
 
-                        "snap_tolerance": 4, "join_tolerance": 4} 
+def _looks_like_table(rows, min_cols=2, min_rows=2, max_rows=15, min_fill=0.4):
+    if not rows or len(rows) < min_rows:
+        return False
+    if len(rows) > max_rows:
+        return False
+    ncols = max(len(r) for r in rows)
+    if ncols < min_cols:
+        return False
+    if len(rows) > 20:
+        print(f"    REJECTED: too many rows ({len(rows)})")
+        return False
+    filled = sum(1 for r in rows for c in r if c and c.strip())
+    total  = sum(len(r) for r in rows) or 1
+    if filled / total < min_fill:
+        print(f"    REJECTED: low fill rate")
+        return False
+    long_cells = sum(1 for r in rows for c in r if c and len(c.split()) > 6)
+    if long_cells / total > 0.15:
+        print(f"    REJECTED: long cells ({long_cells}/{total})")
+        return False
+    if ncols <= 4:
+        avg_words = sum(len(c.split()) for r in rows for c in r if c and c.strip()) / max(filled, 1)
+        if avg_words > 5:
+            print(f"    REJECTED: avg words too high ({avg_words:.1f})")
+            return False
+    sparse_rows = sum(1 for r in rows if sum(1 for c in r if c and c.strip()) <= 1)
+    if sparse_rows / len(rows) > 0.25:
+        print(f"    REJECTED: sparse rows ({sparse_rows}/{len(rows)})")
+        return False
+    print(f"    ACCEPTED: {len(rows)} rows x {ncols} cols")
+    return True
 
-  
-
-def _find_page_tables(page): 
-
-    # ruled tables first; if none, fall back to text-aligned (borderless) 
-
-    tables = page.find_tables(TABLE_SETTINGS_LINES) 
-
-    if not tables: 
-
-        tables = page.find_tables(TABLE_SETTINGS_TEXT) 
-
-    return tables 
-
-  
-
-def _looks_like_table(rows): 
-
-    # guard against the text-strategy turning prose / multi-column text into a "table" 
-
-    if not rows or len(rows) < 2: 
-
-        return False 
-
-    ncols = max(len(r) for r in rows) 
-
-    if ncols < 2: 
-
-        return False 
-
-    filled = sum(1 for r in rows for c in r if c and c.strip()) 
-
-    total  = sum(len(r) for r in rows) or 1 
-
-    return filled / total >= 0.5 
-
-  
-
-def extract_tables_and_bboxes(pdf_path): 
+def _cluster_values(values, gap):
+    if not values:
+        return []
+    values = sorted(set(round(v, 1) for v in values))
+    clusters = [[values[0]]]
+    for v in values[1:]:
+        if v - clusters[-1][-1] <= gap:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    return [sum(c) / len(c) for c in clusters]
 
 
-    table_chunks, bboxes = [], {} 
+def _words_to_grid(words, col_gap=15, row_gap=4):
+    if not words:
+        return []
+    ys = _cluster_values([w["top"] for w in words], gap=row_gap)
+    xs = _cluster_values([w["x0"] for w in words], gap=col_gap)
+    if len(xs) < 2:
+        return []
 
-    try: 
+    def nearest(val, centers):
+        return min(range(len(centers)), key=lambda i: abs(centers[i] - val))
 
-        with pdfplumber.open(pdf_path) as pdf: 
+    grid = defaultdict(lambda: defaultdict(list))
+    for w in words:
+        r = nearest(w["top"], ys)
+        c = nearest(w["x0"], xs)
+        grid[r][c].append(w["text"])
 
-            for page_number, page in enumerate(pdf.pages, start=1): 
+    return [
+        [" ".join(grid[r].get(c, [])) for c in range(len(xs))]
+        for r in sorted(grid)
+    ]
 
-                page_bboxes = [] 
 
-                for t in _find_page_tables(page): 
+def _bboxes_overlap(b1, b2, tolerance=20):
+    return (abs(b1[0] - b2[0]) < tolerance and abs(b1[1] - b2[1]) < tolerance)
 
-                    rows = t.extract() 
 
-                    if not _looks_like_table(rows): 
+def _rows_to_text(rows):
+    return "\n".join(" | ".join((c or "").strip() for c in row) for row in rows)
 
-                        continue 
 
-                    page_bboxes.append(t.bbox)          # same table feeds the mask 
+def _make_table_chunk(pdf_path, text, page_number):
+    return {
+        "chunk_id":        make_chunk_id(pdf_path, text, page_number, page_number),
+        "text":            text,
+        "word_count":      len(text.split()),
+        "page_start":      page_number,
+        "page_end":        page_number,
+        "section_heading": None,
+        "type":            "table",
+    }
 
-                    text = "\n".join( 
+def _extract_word_layout_tables(page, col_gap=15, row_gap=6, min_cols=2, min_rows=2, max_rows=15):
+    """
+    Detect tables purely from word x/y clustering.
+    Works for: LaTeX booktabs, borderless tables, scanned PDFs after OCR.
+    """
+    words = page.extract_words(x_tolerance=3, y_tolerance=3)
+    if not words:
+        return []
 
-                        " | ".join((c or "").strip() for c in row) for row in rows 
+    # Group words into horizontal bands
+    band_map = defaultdict(list)
+    for w in words:
+        band_map[round(w["top"] / row_gap)].append(w)
+    bands = [band_map[k] for k in sorted(band_map)]
 
-                    ) 
+    results = []
+    i = 0
+    while i < len(bands):
+        xs = _cluster_values([w["x0"] for w in bands[i]], gap=col_gap)
+        if len(xs) >= min_cols:
+            region = [bands[i]]
+            j = i + 1
+            while j < len(bands):
+                xs_next = _cluster_values([w["x0"] for w in bands[j]], gap=col_gap)
+                if len(xs_next) >= min_cols:
+                    region.append(bands[j])
+                    j += 1
+                else:
+                    # Allow 1 sparse row (e.g. a sub-header or merged cell)
+                    if j + 1 < len(bands):
+                        xs_skip = _cluster_values([w["x0"] for w in bands[j+1]], gap=col_gap)
+                        if len(xs_skip) >= min_cols:
+                            region.append(bands[j])
+                            region.append(bands[j+1])
+                            j += 2
+                            continue
+                    break
 
-                    table_chunks.append({ 
+            if min_rows <= len(region) <= max_rows:
+                all_words = [w for band in region for w in band]
+                bbox = (
+                    min(w["x0"]     for w in all_words) - 2,
+                    min(w["top"]    for w in all_words) - 2,
+                    max(w["x1"]     for w in all_words) + 2,
+                    max(w["bottom"] for w in all_words) + 2,
+                )
+                rows = _words_to_grid(all_words, col_gap=col_gap, row_gap=row_gap)
+                if _looks_like_table(rows, max_rows=max_rows):
+                    results.append((bbox, rows))
+            i = j
+        else:
+            i += 1
 
-                        "chunk_id": make_chunk_id(pdf_path, text, page_number, page_number), 
+    return results
 
-                        "text": text, 
 
-                        "word_count": len(text.split()), 
+def extract_tables_and_bboxes(pdf_path):
+    table_chunks, bboxes = [], {}
 
-                        "page_start": page_number, 
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                page_bboxes = []
+                seen_bboxes = []
 
-                        "page_end": page_number, 
+                def _register(bbox, rows, _seen=seen_bboxes, _page_bboxes=page_bboxes):
+                    if any(_bboxes_overlap(bbox, s) for s in _seen):
+                        return
+                    _seen.append(bbox)
+                    _page_bboxes.append(bbox)
+                    table_chunks.append(
+                        _make_table_chunk(pdf_path, _rows_to_text(rows), page_number)
+                    )
 
-                        "section_heading": None, 
+                    # Strategy 1 — ruled (vertical + horizontal lines)
+                for t in page.find_tables(TABLE_SETTINGS_LINES):
+                    rows = t.extract()
+                    if _looks_like_table(rows):
+                        _register(t.bbox, rows)
 
-                        "type": "table", 
+                # Strategy 2 — text aligned, skip full-page detections
+                for t in page.find_tables(TABLE_SETTINGS_TEXT):
+                    rows = t.extract()
+                    _, y0, _, y1 = t.bbox
+                    if (y1 - y0) / page.height > 0.6:
+                        continue
+                    if _looks_like_table(rows):
+                        _register(t.bbox, rows)
 
-                    }) 
+                # Strategy 3 — word clustering for borderless tables
+                # (disabled for double-column PDFs — causes over-detection)
+                # if not page_bboxes:
+                #     for bbox, rows in _extract_word_layout_tables(page):
+                #         _register(bbox, rows)
 
-                if page_bboxes: 
+    except Exception as e:
+        print(f"Table extraction error: {e}")
 
-                    bboxes[page_number] = page_bboxes 
+    return table_chunks, bboxes
 
-    except Exception: 
-
-        pass 
-
-    return table_chunks, bboxes 
-
+         
 # FIGURE COUNT
 
 def count_figures(doc):
@@ -632,11 +724,10 @@ def main(pdf_path: str | None = None) -> dict | None:
 
     figure_count = count_figures(doc)
 
-   
-
     doc.close()
 
-    all_chunks = chunks + tables                
+    all_chunks = chunks + tables
+
     print("Is Digital  :", is_digital)
     print("OCR Used    :", ocr_used)
     print("Page Count  :", page_count)
@@ -645,6 +736,8 @@ def main(pdf_path: str | None = None) -> dict | None:
     print("Word Count  :", word_count(text))
     print("Chunk Count :", len(all_chunks))
     print("Figure Count:", figure_count)
+    print("Table Count :", len(tables))
+    print("Table BBoxes:", {k: len(v) for k, v in table_bboxes.items()})
 
     pdf_data = {
         "is_digital":   is_digital,
@@ -653,8 +746,8 @@ def main(pdf_path: str | None = None) -> dict | None:
         "title":        title,
         "authors":      authors if isinstance(authors, list) else [authors],
         "word_count":   word_count(text),
-        "chunks":       all_chunks,            
-        "table_count":  len(tables),            
+        "chunks":       all_chunks,
+        "table_count":  len(tables),
         "figure_count": figure_count,
     }
 
