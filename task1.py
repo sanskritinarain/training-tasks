@@ -8,6 +8,8 @@ import pytesseract
 import io
 import sys
 from collections import defaultdict
+from typing import Optional
+from PIL import Image
 
 # SCAN OR DIGITAL
 
@@ -478,6 +480,8 @@ def word_count(text):
 TABLE_SETTINGS_LINES = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
 TABLE_SETTINGS_TEXT  = {"vertical_strategy": "text", "horizontal_strategy": "text",
                         "snap_tolerance": 4, "join_tolerance": 4}
+TABLE_SETTINGS_HLINES = {"vertical_strategy": "text", "horizontal_strategy": "lines",
+                         "snap_tolerance": 4, "join_tolerance": 4}
 
 def _looks_like_table(rows, min_cols=2, min_rows=2, max_rows=15, min_fill=0.4):
     if not rows or len(rows) < min_rows:
@@ -548,11 +552,168 @@ def _words_to_grid(words, col_gap=15, row_gap=4):
 
 
 def _bboxes_overlap(b1, b2, tolerance=20):
-    return (abs(b1[0] - b2[0]) < tolerance and abs(b1[1] - b2[1]) < tolerance)
+    """Check if two bboxes refer to the same table region."""
+    # Check if corners are close
+    if abs(b1[0] - b2[0]) < tolerance and abs(b1[1] - b2[1]) < tolerance:
+        return True
+    # Check if vertical ranges significantly overlap (same horizontal region)
+    y_overlap = max(0, min(b1[3], b2[3]) - max(b1[1], b2[1]))
+    y_range = max(b1[3] - b1[1], b2[3] - b2[1], 1)
+    if y_overlap / y_range > 0.5:
+        # Also check horizontal overlap
+        x_overlap = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
+        x_range = max(b1[2] - b1[0], b2[2] - b2[0], 1)
+        if x_overlap / x_range > 0.3:
+            return True
+    return False
+
+
+def _find_line_bounded_tables(page, min_lines=2):
+    """
+    Find tables by detecting groups of horizontal lines that bound table regions.
+    Works for IEEE-style tables with only horizontal rules.
+    """
+    mid_x = page.width / 2
+    h_lines = [
+        l for l in page.lines
+        if abs(l["x1"] - l["x0"]) > 20
+        and abs(l["top"] - l["bottom"]) < 2
+    ]
+    if len(h_lines) < min_lines:
+        return []
+
+    # Classify lines by column side
+    def side_of(line):
+        if line["x1"] <= mid_x + 10:
+            return "left"
+        elif line["x0"] >= mid_x - 10:
+            return "right"
+        return "full"
+
+    # Group lines by side
+    groups = {"left": [], "right": [], "full": []}
+    for l in h_lines:
+        s = side_of(l)
+        groups[s].append(l)
+
+    results = []
+    for side, lines in groups.items():
+        if len(lines) < min_lines:
+            continue
+        lines = sorted(lines, key=lambda l: l["top"])
+        # Cluster lines that are within 80pt of each other vertically
+        clusters = []
+        current = [lines[0]]
+        for l in lines[1:]:
+            if l["top"] - current[-1]["top"] < 80:
+                current.append(l)
+            else:
+                clusters.append(current)
+                current = [l]
+        clusters.append(current)
+
+        for cluster in clusters:
+            if len(cluster) < min_lines:
+                continue
+            # Build crop box from the line cluster
+            x0 = min(l["x0"] for l in cluster) - 2
+            x1 = max(l["x1"] for l in cluster) + 2
+            y0 = min(l["top"] for l in cluster) - 4
+            y1 = max(l["top"] for l in cluster) + 25  # padding below last line
+
+            try:
+                crop = page.crop((x0, y0, x1, y1))
+                text = crop.extract_text()
+            except Exception:
+                continue
+            if not text or not text.strip():
+                continue
+
+            # Parse into rows
+            raw_lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+            if len(raw_lines) < 2:
+                continue
+
+            # Split each line into columns by 2+ spaces
+            rows = [re.split(r"  +", ln) for ln in raw_lines]
+            col_counts = [len(r) for r in rows]
+            # If 2+ space split doesn't work, try single space
+            if max(col_counts) < 2:
+                rows = [ln.split() for ln in raw_lines]
+
+            if max(len(r) for r in rows) < 2:
+                continue
+
+            # Trim trailing rows that look like body text (not table data)
+            while len(rows) > 2:
+                last_row = rows[-1]
+                text_in_row = " ".join(last_row)
+                # If the row has many words and few numbers, it's likely prose
+                words = text_in_row.split()
+                num_count = sum(1 for w in words if re.match(r"^[\d.+\-∆]+$", w))
+                if len(words) > 5 and num_count == 0:
+                    rows.pop()
+                else:
+                    break
+
+            bbox = (x0, y0, x1, y1)
+            results.append((bbox, rows))
+
+    return results
 
 
 def _rows_to_text(rows):
     return "\n".join(" | ".join((c or "").strip() for c in row) for row in rows)
+
+
+def _expand_multiline_cells(rows):
+    """Split rows where cells contain newlines into multiple proper rows."""
+    expanded = []
+    for row in rows:
+        cells = [(c or "").strip() for c in row]
+        # Check if any cell has newlines
+        max_lines = max((c.count("\n") + 1) for c in cells) if cells else 1
+        if max_lines <= 1:
+            expanded.append(cells)
+        else:
+            # Split each cell by newlines and zip them into rows
+            split_cells = [c.split("\n") for c in cells]
+            for i in range(max_lines):
+                new_row = []
+                for sc in split_cells:
+                    new_row.append(sc[i].strip() if i < len(sc) else "")
+                expanded.append(new_row)
+    return expanded
+
+
+def _split_text_to_columns(text):
+    """Split a single-column cell with whitespace-separated values into columns."""
+    parts = text.split()
+    return parts
+
+
+def _try_split_single_col_table(rows):
+    """If a table has 1 column with space-separated values, split into proper columns."""
+    if not rows:
+        return rows
+    ncols = max(len(r) for r in rows)
+    if ncols != 1:
+        return rows
+    # Try splitting each row by 2+ spaces first, then by single spaces
+    for sep_pattern in [r"  +", r" +"]:
+        split_rows = []
+        for row in rows:
+            cell = row[0] if row else ""
+            parts = re.split(sep_pattern, cell)
+            split_rows.append(parts)
+        # Check if most non-empty rows have 2+ columns
+        col_counts = [len(r) for r in split_rows if any(c.strip() for c in r)]
+        if not col_counts:
+            continue
+        # Accept if all non-empty rows have at least 2 cols
+        if min(col_counts) >= 2:
+            return split_rows
+    return rows
 
 
 def _make_table_chunk(pdf_path, text, page_number):
@@ -646,7 +807,23 @@ def extract_tables_and_bboxes(pdf_path):
                     if _looks_like_table(rows):
                         _register(t.bbox, rows)
 
-                # Strategy 2 — text aligned, skip full-page detections
+                # Strategy 2 — horizontal lines + text columns (IEEE-style tables)
+                for t in page.find_tables(TABLE_SETTINGS_HLINES):
+                    rows = _expand_multiline_cells(t.extract())
+                    if _looks_like_table(rows):
+                        _register(t.bbox, rows)
+
+                # Strategy 2b — crop into left/right halves for two-column layouts
+                mid_x = page.width / 2
+                for crop_bbox in [(0, 0, mid_x + 5, page.height), (mid_x - 5, 0, page.width, page.height)]:
+                    cropped = page.crop(crop_bbox)
+                    for t in cropped.find_tables(TABLE_SETTINGS_HLINES):
+                        rows = _expand_multiline_cells(t.extract())
+                        rows = _try_split_single_col_table(rows)
+                        if _looks_like_table(rows):
+                            _register(t.bbox, rows)
+
+                # Strategy 3 — text aligned, skip full-page detections
                 for t in page.find_tables(TABLE_SETTINGS_TEXT):
                     rows = t.extract()
                     _, y0, _, y1 = t.bbox
@@ -655,11 +832,19 @@ def extract_tables_and_bboxes(pdf_path):
                     if _looks_like_table(rows):
                         _register(t.bbox, rows)
 
+                # Strategy 4 — line-guided extraction for horizontal-rule tables
+                for bbox, rows in _find_line_bounded_tables(page):
+                    if _looks_like_table(rows):
+                        _register(bbox, rows)
+
                 # Strategy 3 — word clustering for borderless tables
                 # (disabled for double-column PDFs — causes over-detection)
                 # if not page_bboxes:
                 #     for bbox, rows in _extract_word_layout_tables(page):
                 #         _register(bbox, rows)
+
+                if page_bboxes:
+                    bboxes[page_number] = page_bboxes
 
     except Exception as e:
         print(f"Table extraction error: {e}")
@@ -678,7 +863,7 @@ def count_figures(doc):
 
 # MAIN
 
-def main(pdf_path: str | None = None) -> dict | None:
+def main(pdf_path: Optional[str] = None) -> Optional[dict]:
 
     if pdf_path is None:                   
         if len(sys.argv) < 2:
