@@ -10,6 +10,80 @@ import sys
 from collections import defaultdict
 from typing import Optional
 from PIL import Image
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+# VECTOR DB
+_embedder = None
+
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  # fast, 384-dim
+    return _embedder
+
+
+def get_chroma_collection(db_path="./chroma_db", collection_name="rag_docs"):
+    client = chromadb.PersistentClient(path=db_path)
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        metadata={"hnsw:space": "cosine"},
+    )
+    return collection
+
+
+def upsert_chunks_to_chroma(chunks, collection):
+    embedder = get_embedder()
+
+    ids       = [c["chunk_id"] for c in chunks]
+    texts     = [c["text"] for c in chunks]
+    metadatas = [
+        {
+            "type":            c.get("type", "text"),
+            "page_start":      c.get("page_start", 0),
+            "page_end":        c.get("page_end", 0),
+            "section_heading": c.get("section_heading") or "",
+            "word_count":      c.get("word_count", 0),
+        }
+        for c in chunks
+    ]
+
+    embeddings = embedder.encode(texts, show_progress_bar=True).tolist()
+
+    batch = 400
+    for start in range(0, len(ids), batch):
+        collection.upsert(
+            ids=ids[start:start+batch],
+            documents=texts[start:start+batch],
+            embeddings=embeddings[start:start+batch],
+            metadatas=metadatas[start:start+batch],
+        )
+
+    print(f"inserted {len(ids)} chunks → ChromaDB")
+
+
+def query_chroma(query_text, collection, n_results=5, chunk_type=None):
+    embedder = get_embedder()
+    query_vec = embedder.encode([query_text]).tolist()
+
+    where = {"type": chunk_type} if chunk_type else None
+
+    results = collection.query(
+        query_embeddings=query_vec,
+        n_results=n_results,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    hits = []
+    for doc, meta, dist in zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
+    ):
+        hits.append({"text": doc, "meta": meta, "score": 1 - dist})  # cosine → similarity
+
+    return hits
 
 # SCAN OR DIGITAL
 
@@ -935,11 +1009,14 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
         "table_count":  len(tables),
         "figure_count": figure_count,
     }
-
+   
     with open("pdf_output.json", "w", encoding="utf-8") as f:
         json.dump(pdf_data, f, indent=4, ensure_ascii=False)
-
     print("pdf_output.json saved")
+
+    collection = get_chroma_collection()
+    upsert_chunks_to_chroma(all_chunks, collection)
+    print("chunks inserted to ChromaDB")
     return pdf_data
 
 
