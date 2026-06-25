@@ -86,7 +86,7 @@ def query_chroma(query_text, collection, n_results=5, chunk_type=None):
 
     return hits
 
-
+# RELATIONAL DB
 def store_chunks_db(chunks):
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
