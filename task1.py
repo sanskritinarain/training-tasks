@@ -12,6 +12,7 @@ from typing import Optional
 from PIL import Image
 import chromadb
 from sentence_transformers import SentenceTransformer
+import sqlite3
 
 # VECTOR DB
 _embedder = None
@@ -84,6 +85,47 @@ def query_chroma(query_text, collection, n_results=5, chunk_type=None):
         hits.append({"text": doc, "meta": meta, "score": 1 - dist})  # cosine → similarity
 
     return hits
+
+
+def store_chunks_db(chunks):
+    conn = sqlite3.connect("chunks.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+CREATE TABLE IF NOT EXISTS chunks(
+    chunk_id TEXT PRIMARY KEY,
+    text TEXT,
+    page_start INTEGER,
+    page_end INTEGER,
+    word_count INTEGER,
+    section_heading TEXT,
+    type TEXT
+)
+""")
+
+    for chunk in chunks:
+        cursor.execute("""
+INSERT OR REPLACE INTO chunks (
+    chunk_id,
+    text,
+    page_start,
+    page_end,
+    word_count,
+    section_heading,
+    type
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+""", (
+            chunk["chunk_id"],
+            chunk["text"],
+            chunk["page_start"],
+            chunk["page_end"],
+            chunk["word_count"],
+            chunk["section_heading"],
+            chunk["type"],
+        ))
+
+    conn.commit()
+    conn.close()
 
 # SCAN OR DIGITAL
 
@@ -1013,6 +1055,9 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
     with open("pdf_output.json", "w", encoding="utf-8") as f:
         json.dump(pdf_data, f, indent=4, ensure_ascii=False)
     print("pdf_output.json saved")
+
+    store_chunks_db(all_chunks)
+    print("saved to database")
 
     collection = get_chroma_collection()
     upsert_chunks_to_chroma(all_chunks, collection)
