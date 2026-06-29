@@ -13,6 +13,7 @@ from PIL import Image
 import chromadb
 from sentence_transformers import SentenceTransformer
 import sqlite3
+import uuid
 
 # VECTOR DB
 _embedder = None
@@ -39,13 +40,15 @@ def upsert_chunks_to_chroma(chunks, collection):
     ids       = [c["chunk_id"] for c in chunks]
     texts     = [c["text"] for c in chunks]
     metadatas = [
-        {
-            "type":            c.get("type", "text"),
-            "page_start":      c.get("page_start", 0),
-            "page_end":        c.get("page_end", 0),
-            "section_heading": c.get("section_heading") or "",
-            "word_count":      c.get("word_count", 0),
-        }
+    {
+        "doc_id":          c.get("doc_id", ""),
+        "type":            c.get("type", "text"),
+        "page_start":      c.get("page_start", 0),
+        "page_end":        c.get("page_end", 0),
+        "section_heading": c.get("section_heading") or "",
+        "word_count":      c.get("word_count", 0),
+    }
+  
         for c in chunks
     ]
 
@@ -92,9 +95,12 @@ def store_chunks_db(chunks):
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
 
+    # Create table with doc_id
     cursor.execute("""
 CREATE TABLE IF NOT EXISTS chunks(
     chunk_id TEXT PRIMARY KEY,
+    doc_id TEXT,
+    doc_name TEXT, 
     text TEXT,
     page_start INTEGER,
     page_end INTEGER,
@@ -104,19 +110,25 @@ CREATE TABLE IF NOT EXISTS chunks(
 )
 """)
 
+    existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(chunks)")]
+    if "doc_id" not in existing_cols:
+        cursor.execute("ALTER TABLE chunks ADD COLUMN doc_id TEXT")
+
     for chunk in chunks:
         cursor.execute("""
 INSERT OR REPLACE INTO chunks (
     chunk_id,
+    doc_id,
     text,
     page_start,
     page_end,
     word_count,
     section_heading,
     type
-) VALUES (?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 """, (
             chunk["chunk_id"],
+            chunk.get("doc_id", ""),  
             chunk["text"],
             chunk["page_start"],
             chunk["page_end"],
@@ -126,8 +138,7 @@ INSERT OR REPLACE INTO chunks (
         ))
 
     conn.commit()
-    conn.close()
-
+    
 # SCAN OR DIGITAL
 
 def if_digital(doc, threshold=0.7):
@@ -307,15 +318,8 @@ def clean_ocr_pages(page_texts):
 
 def make_chunk_id(pdf_path, chunk_text, page_start, page_end):
     base = os.path.splitext(os.path.basename(pdf_path))[0]
-
-    raw = (
-        f"{page_start}_"
-        f"{page_end}_"
-        f"{chunk_text[:200]}"
-    )
-
+    raw = f"{page_start}_{page_end}_{chunk_text[:200]}"
     digest = hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
-
     return f"{base}_{digest}"
 
 
@@ -1029,8 +1033,17 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
 
     doc.close()
 
-    all_chunks = chunks + tables
+    # define everything FIRST
+    doc_id   = str(uuid.uuid4())
+    doc_name = re.sub(r"\s*\(\d+\)$", "", os.path.splitext(os.path.basename(pdf_path))[0]).strip()
 
+    all_chunks = chunks + tables
+    for chunk in all_chunks:
+        chunk["doc_id"]   = doc_id
+        chunk["doc_name"] = doc_name
+
+    print("Doc ID      :", doc_id)
+    print("Doc Name    :", doc_name)
     print("Is Digital  :", is_digital)
     print("OCR Used    :", ocr_used)
     print("Page Count  :", page_count)
@@ -1043,6 +1056,8 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
     print("Table BBoxes:", {k: len(v) for k, v in table_bboxes.items()})
 
     pdf_data = {
+        "doc_id":       doc_id,
+        "doc_name":     doc_name,
         "is_digital":   is_digital,
         "ocr_used":     ocr_used,
         "page_count":   page_count,
@@ -1053,7 +1068,7 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
         "table_count":  len(tables),
         "figure_count": figure_count,
     }
-   
+
     with open("pdf_output.json", "w", encoding="utf-8") as f:
         json.dump(pdf_data, f, indent=4, ensure_ascii=False)
     print("pdf_output.json saved")
@@ -1066,9 +1081,5 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
     print("chunks inserted to ChromaDB")
     return pdf_data
 
-
 if __name__ == "__main__":
     main()
-
-
-    
