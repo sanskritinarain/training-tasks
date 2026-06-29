@@ -87,6 +87,7 @@ def query_chroma(query_text, collection, n_results=5, chunk_type=None):
     return hits
 
 # RELATIONAL DB
+
 def store_chunks_db(chunks):
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
@@ -599,36 +600,37 @@ TABLE_SETTINGS_TEXT  = {"vertical_strategy": "text", "horizontal_strategy": "tex
 TABLE_SETTINGS_HLINES = {"vertical_strategy": "text", "horizontal_strategy": "lines",
                          "snap_tolerance": 4, "join_tolerance": 4}
 
-def _looks_like_table(rows, min_cols=2, min_rows=2, max_rows=15, min_fill=0.4):
+def _looks_like_table(rows, min_cols=2, min_rows=2, max_rows=15, min_fill=0.4, debug=False):
     if not rows or len(rows) < min_rows:
         return False
     if len(rows) > max_rows:
+        if debug: print(f"    REJECTED: too many rows ({len(rows)})")
         return False
     ncols = max(len(r) for r in rows)
     if ncols < min_cols:
         return False
     if len(rows) > 20:
-        print(f"    REJECTED: too many rows ({len(rows)})")
+        if debug: print(f"    REJECTED: too many rows ({len(rows)})")
         return False
     filled = sum(1 for r in rows for c in r if c and c.strip())
     total  = sum(len(r) for r in rows) or 1
     if filled / total < min_fill:
-        print(f"    REJECTED: low fill rate")
+        if debug: print(f"    REJECTED: low fill rate")
         return False
     long_cells = sum(1 for r in rows for c in r if c and len(c.split()) > 6)
     if long_cells / total > 0.15:
-        print(f"    REJECTED: long cells ({long_cells}/{total})")
+        if debug: print(f"    REJECTED: long cells ({long_cells}/{total})")
         return False
     if ncols <= 4:
         avg_words = sum(len(c.split()) for r in rows for c in r if c and c.strip()) / max(filled, 1)
         if avg_words > 5:
-            print(f"    REJECTED: avg words too high ({avg_words:.1f})")
+            if debug: print(f"    REJECTED: avg words too high ({avg_words:.1f})")
             return False
     sparse_rows = sum(1 for r in rows if sum(1 for c in r if c and c.strip()) <= 1)
     if sparse_rows / len(rows) > 0.25:
-        print(f"    REJECTED: sparse rows ({sparse_rows}/{len(rows)})")
+        if debug: print(f"    REJECTED: sparse rows ({sparse_rows}/{len(rows)})")
         return False
-    print(f"    ACCEPTED: {len(rows)} rows x {ncols} cols")
+    if debug: print(f"    ACCEPTED: {len(rows)} rows x {ncols} cols")
     return True
 
 def _cluster_values(values, gap):
