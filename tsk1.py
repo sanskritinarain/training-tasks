@@ -14,6 +14,118 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 import sqlite3
 import uuid
+import requests
+
+OLLAMA_URL    = "http://localhost:11434/api/generate"
+OLLAMA_MODEL  = "llama3.2"       
+SHORT_DOC_LIMIT = 3000            
+
+def _ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
+    """Single blocking call to local Ollama."""
+    try:
+        resp = requests.post(OLLAMA_URL, json={
+            "model":  model,
+            "prompt": prompt,
+            "stream": False,
+        }, timeout=300)
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    except Exception as e:
+        print(f"Ollama error: {e}")
+        return ""
+
+
+def _summarize_single(text: str, title: str = "") -> str:
+    """Single-pass summary for short docs."""
+    prompt = f"""You are a research assistant. Summarize the following document clearly and concisely.
+Cover: main objective, methods used, key findings, and conclusions.
+Keep it under 200 words.
+
+Title: {title}
+
+Document:
+{text}
+
+Summary:"""
+    return _ollama(prompt)
+
+
+def _summarize_chunk(chunk_text: str, index: int, total: int) -> str:
+    """Summarize one chunk during map phase."""
+    prompt = f"""Summarize this section (part {index}/{total}) of a research document in 3-4 sentences.
+Focus on key facts, methods, or findings mentioned.
+
+Section:
+{chunk_text}
+
+Summary:"""
+    return _ollama(prompt)
+
+
+def _summarize_reduce(partial_summaries: list[str], title: str = "") -> str:
+    """
+    Agar summaries zyada hain toh pehle batches mein combine karo,
+    phir final ek summary banao. (Hierarchical reduce)
+    """
+    BATCH_SIZE = 5  
+
+    
+    while len(partial_summaries) > BATCH_SIZE:
+        batched = []
+        for i in range(0, len(partial_summaries), BATCH_SIZE):
+            batch = partial_summaries[i:i+BATCH_SIZE]
+            combined = "\n\n".join(
+                f"[Part {j+1}]: {s}" for j, s in enumerate(batch) if s
+            )
+            prompt = f"""Combine these section summaries into one paragraph (max 100 words):
+
+{combined}
+
+Combined Summary:"""
+            print(f"  Batch reducing {i//BATCH_SIZE + 1}...")
+            result = _ollama(prompt)
+            if result:
+                batched.append(result)
+        partial_summaries = batched  # next round
+
+    # Step 2 — final reduce
+    combined = "\n\n".join(
+        f"[Part {i+1}]: {s}" for i, s in enumerate(partial_summaries) if s
+    )
+    prompt = f"""You are a research assistant. Below are section-wise summaries of a document.
+Write a single coherent summary covering: objective, methods, findings, and conclusions.
+Keep it under 250 words.
+
+Title: {title}
+
+Section Summaries:
+{combined}
+
+Final Summary:"""
+    return _ollama(prompt)
+
+
+def generate_summary(full_text: str, chunks: list, title: str = "") -> str:
+ 
+    wc = len(full_text.split())
+    print(f"Generating summary (strategy: {'single-pass' if wc <= SHORT_DOC_LIMIT else 'map-reduce'}, {wc} words)...")
+
+    if wc <= SHORT_DOC_LIMIT:
+        return _summarize_single(full_text, title)
+
+    # map phase 
+    text_chunks = [c for c in chunks if c.get("type") == "text"]
+    total = len(text_chunks)
+    partial = []
+    for i, chunk in enumerate(text_chunks, 1):
+        print(f"  Summarizing chunk {i}/{total}...")
+        s = _summarize_chunk(chunk["text"], i, total)
+        if s:
+            partial.append(s)
+
+
+    print("  Reducing to final summary...")
+    return _summarize_reduce(partial, title)
 
 # VECTOR DB
 _embedder = None
@@ -90,6 +202,46 @@ def query_chroma(query_text, collection, n_results=5, chunk_type=None):
     return hits
 
 # RELATIONAL DB
+def init_documents_table():
+    conn = sqlite3.connect("chunks.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+CREATE TABLE IF NOT EXISTS documents (
+    doc_id      TEXT PRIMARY KEY,
+    doc_name    TEXT,
+    title       TEXT,
+    authors     TEXT,
+    page_count  INTEGER,
+    word_count  INTEGER,
+    chunk_count INTEGER,
+    table_count INTEGER,
+    figure_count INTEGER,
+    summary     TEXT,
+    created_at  TEXT DEFAULT (datetime('now'))
+)
+""")
+    conn.commit()
+    conn.close()
+
+
+def store_document_record(doc_id, doc_name, title, authors, page_count,
+                          word_count, chunk_count, table_count, figure_count, summary):
+    conn = sqlite3.connect("chunks.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+INSERT OR REPLACE INTO documents (
+    doc_id, doc_name, title, authors, page_count,
+    word_count, chunk_count, table_count, figure_count, summary
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+        doc_id, doc_name, title,
+        json.dumps(authors),   # store as JSON list
+        page_count, word_count, chunk_count,
+        table_count, figure_count, summary
+    ))
+    conn.commit()
+    conn.close()
+
 
 def store_chunks_db(chunks):
     conn = sqlite3.connect("chunks.db")
@@ -119,6 +271,7 @@ CREATE TABLE IF NOT EXISTS chunks(
 INSERT OR REPLACE INTO chunks (
     chunk_id,
     doc_id,
+    doc_name,
     text,
     page_start,
     page_end,
@@ -129,6 +282,7 @@ INSERT OR REPLACE INTO chunks (
 """, (
             chunk["chunk_id"],
             chunk.get("doc_id", ""),  
+            chunk.get("doc_name", ""),
             chunk["text"],
             chunk["page_start"],
             chunk["page_end"],
@@ -789,7 +943,7 @@ def _rows_to_text(rows):
 
 
 def _expand_multiline_cells(rows):
-    """Split rows where cells contain newlines into multiple proper rows."""
+   
     expanded = []
     for row in rows:
         cells = [(c or "").strip() for c in row]
@@ -809,13 +963,13 @@ def _expand_multiline_cells(rows):
 
 
 def _split_text_to_columns(text):
-    """Split a single-column cell with whitespace-separated values into columns."""
+   
     parts = text.split()
     return parts
 
 
 def _try_split_single_col_table(rows):
-    """If a table has 1 column with space-separated values, split into proper columns."""
+    
     if not rows:
         return rows
     ncols = max(len(r) for r in rows)
@@ -850,10 +1004,7 @@ def _make_table_chunk(pdf_path, text, page_number):
     }
 
 def _extract_word_layout_tables(page, col_gap=15, row_gap=6, min_cols=2, min_rows=2, max_rows=15):
-    """
-    Detect tables purely from word x/y clustering.
-    Works for: LaTeX booktabs, borderless tables, scanned PDFs after OCR.
-    """
+    
     words = page.extract_words(x_tolerance=3, y_tolerance=3)
     if not words:
         return []
@@ -1041,6 +1192,23 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
     for chunk in all_chunks:
         chunk["doc_id"]   = doc_id
         chunk["doc_name"] = doc_name
+
+    # generate summary
+    summary = generate_summary(text, all_chunks, title or doc_name)
+    print("\n--- DOCUMENT SUMMARY ---")
+    print(summary)
+    print("------------------------\n")
+
+    # store document record
+    init_documents_table()
+    store_document_record(
+        doc_id, doc_name, title,
+        authors if isinstance(authors, list) else [authors],
+        page_count, word_count(text),
+        len(all_chunks), len(tables), figure_count,
+        summary
+    )
+    print("document record saved")
 
     print("Doc ID      :", doc_id)
     print("Doc Name    :", doc_name)
