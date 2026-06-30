@@ -35,19 +35,39 @@ def _ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         return ""
 
 
-def _summarize_single(text: str, title: str = "") -> str:
+def _parse_summary_json(raw: str) -> dict:
+    cleaned = re.sub(r"^```json|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    try:
+        data = json.loads(cleaned)
+        return {
+            "overview": data.get("overview", ""),
+            "key_points": data.get("key_points", []),
+            "topics": data.get("topics", []),
+        }
+    except Exception as e:
+        print(f"Summary JSON parse failed: {e}")
+        return {"overview": raw.strip(), "key_points": [], "topics": []}
+    
+
+
+def _summarize_single(text: str, title: str = "") -> dict:
     """Single-pass summary for short docs."""
-    prompt = f"""You are a research assistant. Summarize the following document clearly and concisely.
-Cover: main objective, methods used, key findings, and conclusions.
-Keep it under 200 words.
+    prompt = f"""You are a research assistant. Analyze the following document.
+Respond ONLY with valid JSON (no markdown, no preamble, no explanation) in this EXACT shape:
+{{
+  "overview": "2-3 sentence summary covering objective, methods, findings, and conclusions, under 200 words",
+  "key_points": ["short factual bullet 1", "short factual bullet 2", "..."],
+  "topics": ["topic1", "topic2", "..."]
+}}
 
 Title: {title}
 
 Document:
 {text}
 
-Summary:"""
-    return _ollama(prompt)
+JSON:"""
+    raw = _ollama(prompt)
+    return _parse_summary_json(raw)
 
 
 def _summarize_chunk(chunk_text: str, index: int, total: int) -> str:
@@ -62,14 +82,9 @@ Summary:"""
     return _ollama(prompt)
 
 
-def _summarize_reduce(partial_summaries: list[str], title: str = "") -> str:
-    """
-    Agar summaries zyada hain toh pehle batches mein combine karo,
-    phir final ek summary banao. (Hierarchical reduce)
-    """
+def _summarize_reduce(partial_summaries: list[str], title: str = "") -> dict:
     BATCH_SIZE = 5  
 
-    
     while len(partial_summaries) > BATCH_SIZE:
         batched = []
         for i in range(0, len(partial_summaries), BATCH_SIZE):
@@ -86,34 +101,37 @@ Combined Summary:"""
             result = _ollama(prompt)
             if result:
                 batched.append(result)
-        partial_summaries = batched  # next round
+        partial_summaries = batched
 
-    # Step 2 — final reduce
     combined = "\n\n".join(
         f"[Part {i+1}]: {s}" for i, s in enumerate(partial_summaries) if s
     )
     prompt = f"""You are a research assistant. Below are section-wise summaries of a document.
-Write a single coherent summary covering: objective, methods, findings, and conclusions.
-Keep it under 250 words.
+Respond ONLY with valid JSON (no markdown, no preamble, no explanation) in this EXACT shape:
+{{
+  "overview": "single coherent paragraph covering objective, methods, findings, and conclusions, under 250 words",
+  "key_points": ["short factual bullet 1", "short factual bullet 2", "..."],
+  "topics": ["topic1", "topic2", "..."]
+}}
 
 Title: {title}
 
 Section Summaries:
 {combined}
 
-Final Summary:"""
-    return _ollama(prompt)
+JSON:"""
+    raw = _ollama(prompt)
+    return _parse_summary_json(raw)
 
+    
 
-def generate_summary(full_text: str, chunks: list, title: str = "") -> str:
- 
+def generate_summary(full_text: str, chunks: list, title: str = "") -> dict:
     wc = len(full_text.split())
     print(f"Generating summary (strategy: {'single-pass' if wc <= SHORT_DOC_LIMIT else 'map-reduce'}, {wc} words)...")
 
     if wc <= SHORT_DOC_LIMIT:
         return _summarize_single(full_text, title)
 
-    # map phase 
     text_chunks = [c for c in chunks if c.get("type") == "text"]
     total = len(text_chunks)
     partial = []
@@ -122,7 +140,6 @@ def generate_summary(full_text: str, chunks: list, title: str = "") -> str:
         s = _summarize_chunk(chunk["text"], i, total)
         if s:
             partial.append(s)
-
 
     print("  Reducing to final summary...")
     return _summarize_reduce(partial, title)
@@ -178,11 +195,22 @@ def upsert_chunks_to_chroma(chunks, collection):
     print(f"inserted {len(ids)} chunks → ChromaDB")
 
 
-def query_chroma(query_text, collection, n_results=5, chunk_type=None):
+def query_chroma(query_text, collection, n_results=5, chunk_type=None, doc_id=None):
     embedder = get_embedder()
     query_vec = embedder.encode([query_text]).tolist()
 
-    where = {"type": chunk_type} if chunk_type else None
+    conditions = []
+    if chunk_type:
+        conditions.append({"type": chunk_type})
+    if doc_id:
+        conditions.append({"doc_id": doc_id})
+
+    if len(conditions) > 1:
+        where = {"$and": conditions}
+    elif len(conditions) == 1:
+        where = conditions[0]
+    else:
+        where = None
 
     results = collection.query(
         query_embeddings=query_vec,
@@ -235,9 +263,10 @@ INSERT OR REPLACE INTO documents (
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """, (
         doc_id, doc_name, title,
-        json.dumps(authors),   # store as JSON list
+        json.dumps(authors),  
         page_count, word_count, chunk_count,
-        table_count, figure_count, summary
+        table_count, figure_count,
+        json.dumps(summary)    
     ))
     conn.commit()
     conn.close()
@@ -266,6 +295,9 @@ CREATE TABLE IF NOT EXISTS chunks(
     if "doc_id" not in existing_cols:
         cursor.execute("ALTER TABLE chunks ADD COLUMN doc_id TEXT")
 
+    if "doc_name" not in existing_cols:
+        cursor.execute("ALTER TABLE chunks ADD COLUMN doc_name TEXT")
+
     for chunk in chunks:
         cursor.execute("""
 INSERT OR REPLACE INTO chunks (
@@ -278,7 +310,7 @@ INSERT OR REPLACE INTO chunks (
     word_count,
     section_heading,
     type
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 """, (
             chunk["chunk_id"],
             chunk.get("doc_id", ""),  
@@ -767,9 +799,7 @@ def _looks_like_table(rows, min_cols=2, min_rows=2, max_rows=15, min_fill=0.4, d
     ncols = max(len(r) for r in rows)
     if ncols < min_cols:
         return False
-    if len(rows) > 20:
-        if debug: print(f"    REJECTED: too many rows ({len(rows)})")
-        return False
+   
     filled = sum(1 for r in rows for c in r if c and c.strip())
     total  = sum(len(r) for r in rows) or 1
     if filled / total < min_fill:
@@ -1148,11 +1178,17 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
         print(f"File not found: {pdf_path}")
         return None
 
+
+
     try:
         doc = pymupdf.open(pdf_path)
     except Exception as e:
         print(f"Failed to open pdf: {e}")
         return None
+
+    with open(pdf_path, "rb") as f:
+        file_bytes = f.read()
+        doc_id = hashlib.md5(file_bytes).hexdigest()[:12]
 
     if doc.needs_pass:
         print("pdf has password")
@@ -1184,8 +1220,7 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
 
     doc.close()
 
-    # define everything FIRST
-    doc_id   = str(uuid.uuid4())
+  
     doc_name = re.sub(r"\s*\(\d+\)$", "", os.path.splitext(os.path.basename(pdf_path))[0]).strip()
 
     all_chunks = chunks + tables
@@ -1193,13 +1228,13 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
         chunk["doc_id"]   = doc_id
         chunk["doc_name"] = doc_name
 
-    # generate summary
+   # generate summary
     summary = generate_summary(text, all_chunks, title or doc_name)
     print("\n--- DOCUMENT SUMMARY ---")
-    print(summary)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))  
     print("------------------------\n")
 
-    # store document record
+    # store document record 
     init_documents_table()
     store_document_record(
         doc_id, doc_name, title,
