@@ -150,7 +150,7 @@ _embedder = None
 def get_embedder():
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  # fast, 384-dim
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  
     return _embedder
 
 
@@ -225,7 +225,7 @@ def query_chroma(query_text, collection, n_results=5, chunk_type=None, doc_id=No
         results["metadatas"][0],
         results["distances"][0],
     ):
-        hits.append({"text": doc, "meta": meta, "score": 1 - dist})  # cosine → similarity
+        hits.append({"text": doc, "meta": meta, "score": 1 - dist}) 
 
     return hits
 
