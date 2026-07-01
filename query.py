@@ -1,21 +1,79 @@
-from tsk1 import get_chroma_collection, query_chroma
+import argparse
 import json
+import sqlite3
+from rag_agent import answer_question as generate_answer  
 
-with open("pdf_output.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
 
-col = get_chroma_collection()
+def get_document_record(doc_id, db_path="chunks.db"):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,))
+    row = cursor.fetchone()
+    conn.close()
 
-question = "who wrote this paper?"
+    if row is None:
+        return None
 
-if any(word in question.lower() for word in ["author", "wrote", "written", "writer"]):
-    print("Authors:", ", ".join(data["authors"]))
+    record = dict(row)
+    try:
+        record["authors"] = json.loads(record["authors"]) if record["authors"] else []
+    except (TypeError, json.JSONDecodeError):
+        record["authors"] = []
 
-elif any(word in question.lower() for word in ["title",  "name"]):
-    print("Title:", data["title"])
+    try:
+        record["summary"] = json.loads(record["summary"]) if record["summary"] else {}
+    except (TypeError, json.JSONDecodeError):
+        record["summary"] = {}
 
-else:
-    hits = query_chroma(question, col, n_results=3)
-    for h in hits:
-        print(h["text"][:300])
-        print("---")
+    return record
+
+
+def handle_query(question, doc_id, n_results=3):       
+
+    record = get_document_record(doc_id)
+    if record is None:
+        print(f"No document found for doc_id={doc_id}.")
+        return
+
+    q = question.lower()
+
+    if any(word in q for word in ["author", "wrote", "written", "writer"]):
+        authors = record.get("authors") or []
+        print("Authors:", ", ".join(authors) if authors else "Unknown")
+        return
+
+    if any(word in q for word in ["title", "name"]):
+        print("Title:", record.get("title") or "Unknown")
+        return
+
+    # ↓ REPLACED: raw chunk-dump loop → grounded LLM answer via rag_agent
+    result = generate_answer(question, doc_id, k=n_results)
+
+    print("Answer:", result["answer"])
+    print("Grounded:", result["grounded"])
+    print("Confidence:", round(result["confidence"], 3))
+    if result["sources"]:
+        print("Sources:")
+        for s in result["sources"]:
+            loc = f"page {s['page_start']}" + (
+                f"-{s['page_end']}" if s['page_end'] != s['page_start'] else ""
+            )
+            sect = f", {s['section']}" if s.get("section") else ""
+            print(f"  - {loc}{sect} ({s['type']}, score={s['score']:.2f})")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="query a single ingested document by doc_id"
+    )
+    parser.add_argument("doc_id", help="doc_id of the document to query (from the documents table)")
+    parser.add_argument("ques", help="ques to ask about the document")
+    parser.add_argument("--n-results", type=int, default=3, help="Number of chunks to retrieve")
+    args = parser.parse_args()
+
+    handle_query(args.ques, args.doc_id, args.n_results)   # ← updated call
+
+
+if __name__ == "__main__":
+    main()
