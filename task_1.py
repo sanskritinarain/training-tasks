@@ -13,7 +13,6 @@ from PIL import Image
 import chromadb
 from sentence_transformers import SentenceTransformer
 import sqlite3
-import uuid
 import requests
 
 OLLAMA_URL    = "http://localhost:11434/api/generate"
@@ -150,7 +149,7 @@ _embedder = None
 def get_embedder():
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  # fast, 384-dim
     return _embedder
 
 
@@ -160,6 +159,8 @@ def get_chroma_collection(db_path="./chroma_db", collection_name="rag_docs"):
         name=collection_name,
         metadata={"hnsw:space": "cosine"},
     )
+    assert collection.metadata.get("hnsw:space") == "cosine", \
+        f"Expected cosine space, got: {collection.metadata}"
     return collection
 
 
@@ -181,7 +182,7 @@ def upsert_chunks_to_chroma(chunks, collection):
         for c in chunks
     ]
 
-    embeddings = embedder.encode(texts, show_progress_bar=True).tolist()
+    embeddings = embedder.encode(texts, show_progress_bar=True, normalize_embeddings=True).tolist()
 
     batch = 400
     for start in range(0, len(ids), batch):
@@ -197,7 +198,7 @@ def upsert_chunks_to_chroma(chunks, collection):
 
 def query_chroma(query_text, collection, n_results=5, chunk_type=None, doc_id=None):
     embedder = get_embedder()
-    query_vec = embedder.encode([query_text]).tolist()
+    query_vec = embedder.encode([query_text], normalize_embeddings=True).tolist()
 
     conditions = []
     if chunk_type:
@@ -225,7 +226,7 @@ def query_chroma(query_text, collection, n_results=5, chunk_type=None, doc_id=No
         results["metadatas"][0],
         results["distances"][0],
     ):
-        hits.append({"text": doc, "meta": meta, "score": 1 - dist}) 
+        hits.append({"text": doc, "meta": meta, "score": 1 - dist})  # cosine → similarity
 
     return hits
 
