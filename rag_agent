@@ -3,20 +3,25 @@ from task_1 import query_chroma, get_chroma_collection, _ollama
 
 # CONFIG
 K_DEFAULT = 5
+MIN_CONFIDENCE = 0.35   
 NOT_FOUND_MSG = "I couldn't find this in the document."
 
 PROMPT_TEMPLATE = """You are a research assistant. Answer the question using ONLY the sources below.
-Cite the sources you use with their number, like [Source 2].
-If the answer is not in the sources, reply exactly: "NOT_IN_CONTEXT".
-Do not use outside knowledge.
+
+Rules:
+- Answer concisely in 1-3 sentences using only the specific facts. Do not add background or restate the question.
+- Give a direct, specific answer. Do NOT say "there is no specific answer" if relevant information exists in the sources — extract it. Do NOT summarize the passage.
+- Give a longer answer only if the user explicitly asks for more detail.
+- Cite the source number like [Source 2].
+- If truly no relevant information exists, reply exactly: "NOT_IN_CONTEXT".
+- Do not use outside knowledge.
 
 Question: {question}
 
 Sources:
 {context}
 
-Answer:"""
-
+Direct Answer:"""
 
 def build_context(hits):
     blocks = []
@@ -45,7 +50,6 @@ def _extract_cited_sources(answer_text, hits):
             })
     return sources
 
-
 def answer_question(question, doc_id, k=K_DEFAULT):
     collection = get_chroma_collection()
     hits = query_chroma(question, collection, n_results=k, doc_id=doc_id)
@@ -58,6 +62,19 @@ def answer_question(question, doc_id, k=K_DEFAULT):
             "grounded": False,
         }
 
+    # top 3 average confidence
+    top_n = hits[:3]
+    avg_confidence = sum(h["score"] for h in top_n) / len(top_n)
+
+    # confidence gate 
+    if hits[0]["score"] < MIN_CONFIDENCE:
+        return {
+            "answer": NOT_FOUND_MSG,
+            "sources": [],
+            "confidence": avg_confidence,
+            "grounded": False,
+        }
+
     context = build_context(hits)
     prompt = PROMPT_TEMPLATE.format(question=question, context=context)
     raw = _ollama(prompt).strip()
@@ -66,15 +83,25 @@ def answer_question(question, doc_id, k=K_DEFAULT):
         return {
             "answer": NOT_FOUND_MSG,
             "sources": [],
-            "confidence": hits[0]["score"],
+            "confidence": avg_confidence,
             "grounded": False,
         }
 
     sources = _extract_cited_sources(raw, hits)
 
+    if not sources:
+        m = hits[0]["meta"]
+        sources = [{
+            "page_start": m["page_start"],
+            "page_end": m["page_end"],
+            "section": m.get("section_heading"),
+            "type": m.get("type"),
+            "score": hits[0]["score"],
+        }]
+
     return {
         "answer": raw,
         "sources": sources,
-        "confidence": hits[0]["score"],
+        "confidence": avg_confidence,
         "grounded": True,
     }
