@@ -14,23 +14,26 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 import sqlite3
 import requests
+import os
+from groq import Groq
 
-OLLAMA_URL    = "http://localhost:11434/api/generate"
-OLLAMA_MODEL  = "llama3.2"       
-SHORT_DOC_LIMIT = 3000            
 
-def _ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
-    """Single blocking call to local Ollama."""
+GROQ_MODEL = "llama-3.3-70b-versatile"   
+_groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+
+def _ollama(prompt: str, model: str = None) -> str:
+    """Kept the name `_ollama` so rag_agent.py doesn't need any other changes."""
     try:
-        resp = requests.post(OLLAMA_URL, json={
-            "model":  model,
-            "prompt": prompt,
-            "stream": False,
-        }, timeout=300)
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        resp = _groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=500,
+        )
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        print(f"Ollama error: {e}")
+        print(f"Groq error: {e}")
         return ""
 
 
