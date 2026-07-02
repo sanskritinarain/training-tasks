@@ -47,7 +47,7 @@ def handle_query(question, doc_id, n_results=3):
         print("Title:", record.get("title") or "Unknown")
         return
 
-    # ↓ REPLACED: raw chunk-dump loop → grounded LLM answer via rag_agent
+    
     result = generate_answer(question, doc_id, k=n_results)
 
     print("Answer:", result["answer"])
@@ -72,7 +72,7 @@ def main():
     parser.add_argument("--n-results", type=int, default=3, help="Number of chunks to retrieve")
     args = parser.parse_args()
 
-    handle_query(args.ques, args.doc_id, args.n_results)   # ← updated call
+    handle_query(args.ques, args.doc_id, args.n_results)  
 
 
 if __name__ == "__main__":
