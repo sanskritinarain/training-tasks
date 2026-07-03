@@ -1,10 +1,13 @@
 import re
 from task_1 import query_chroma, get_chroma_collection, _ollama
+from web_search import web_search
 
 # CONFIG
 K_DEFAULT = 5
-MIN_CONFIDENCE = 0.35   
-NOT_FOUND_MSG = "I couldn't find this in the document."
+WEB_K_DEFAULT = 3
+MIN_CONFIDENCE = 0.35
+WEB_MIN_OVERLAP = 0.15
+WEB_NOT_FOUND_MSG = "I couldn't find reliable information on the web."
 
 PROMPT_TEMPLATE = """You are a research assistant. Answer the question using ONLY the sources below.
 
@@ -23,6 +26,26 @@ Sources:
 
 Direct Answer:"""
 
+
+WEB_PROMPT_TEMPLATE = """You are a research assistant. Answer the question using ONLY the web search results below.
+
+Rules:
+- Answer concisely in 1-3 sentences using only the specific facts. Do not add background or restate the question.
+- Give a direct, specific answer. Do NOT say "there is no specific answer" if relevant information exists — extract it. Do NOT summarize the passage.
+- Give a longer answer only if the user explicitly asks for more detail.
+- Cite the source number like [Web 2].
+- If the results disagree, note the disagreement briefly instead of picking one side silently.
+- Answer ONLY using the information present in the web search snippets below. Do not use your own knowledge.
+- If truly no relevant information exists in these results, reply exactly: "NOT_IN_CONTEXT".
+
+Question: {question}
+
+Web Results:
+{context}
+
+Direct Answer:"""
+
+
 def build_context(hits):
     blocks = []
     for i, h in enumerate(hits, 1):
@@ -32,6 +55,17 @@ def build_context(hits):
         )
         sect = f", {m['section_heading']}" if m.get("section_heading") else ""
         blocks.append(f"[Source {i} | {loc}{sect}]\n{h['text']}")
+    return "\n\n".join(blocks)
+
+
+def build_web_context(results):
+   
+    blocks = []
+    for i, r in enumerate(results, 1):
+        title = r.get("title") or "Untitled"
+        url = r.get("url", "")
+        snippet = r.get("snippet", "")
+        blocks.append(f"[Web {i} | {url}]\n\nTitle:\n{title}\n\nSnippet:\n{snippet}")
     return "\n\n".join(blocks)
 
 
@@ -50,42 +84,131 @@ def _extract_cited_sources(answer_text, hits):
             })
     return sources
 
+
+def _extract_cited_web_sources(answer_text, results):
+   
+    cited_nums = sorted(set(int(n) for n in re.findall(r"\[Web (\d+)\]", answer_text)))
+    sources = []
+    for n in cited_nums:
+        if 1 <= n <= len(results):
+            r = results[n - 1]
+            sources.append({
+                "title": r.get("title"),
+                "url": r.get("url"),
+                "type": "web",
+            })
+    return sources
+
+
+_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were",
+    "in", "on", "at", "of", "to", "for", "and", "or",
+    "what", "when", "where", "who", "how",
+    "which", "why",
+    "does", "do", "did",
+    "this", "that", "these", "those",
+    "with", "as", "by", "it",
+}
+
+
+def _keyword_overlap(question, text):
+    """Fraction of non-stopword question terms that appear in text (case-insensitive)."""
+    q_words = {w.strip(".,?!'\"") for w in question.lower().split()} - _STOPWORDS
+    if not q_words:
+        return 1.0  
+    t_words = {w.strip(".,?!'\"") for w in text.lower().split()}
+    hits = sum(1 for w in q_words if w in t_words)
+    return hits / len(q_words)
+
+
+def _filter_relevant_web_results(question, results, min_overlap=WEB_MIN_OVERLAP):
+
+    kept = []
+    for r in results:
+        combined = f"{r.get('title', '')} {r.get('snippet', '')}"
+        if _keyword_overlap(question, combined) >= min_overlap:
+            kept.append(r)
+    return kept
+
+
+def generate_web_answer(question, web_results):
+ 
+    if not web_results:
+        return {
+            "answer": WEB_NOT_FOUND_MSG,
+            "sources": [],
+            "confidence": None,
+            "grounded": False,
+            "source_type": "none",
+        }
+
+    web_results = _filter_relevant_web_results(
+        question,
+        web_results,
+        min_overlap=WEB_MIN_OVERLAP,
+    )
+    if not web_results:
+        return {
+            "answer": WEB_NOT_FOUND_MSG,
+            "sources": [],
+            "confidence": None,
+            "grounded": False,
+            "source_type": "none",
+        }
+
+    context = build_web_context(web_results)
+    prompt = WEB_PROMPT_TEMPLATE.format(question=question, context=context)
+    raw = _ollama(prompt).strip()
+    if not raw or "NOT_IN_CONTEXT" in raw:
+        return {
+            "answer": WEB_NOT_FOUND_MSG,
+            "sources": [],
+            "confidence": None,
+            "grounded": False,
+            "source_type": "none",
+        }
+
+    sources = _extract_cited_web_sources(raw, web_results)
+    if not sources:
+        r = web_results[0]
+        sources = [{"title": r.get("title"), "url": r.get("url"), "type": "web"}]
+
+    return {
+        "answer": f"[Web Search] {raw}",
+        "sources": sources,
+        "confidence": None,  
+        "grounded": True,
+        "source_type": "web",
+    }
+
+
+def _web_fallback(question):
+ 
+    results = web_search(question, k=WEB_K_DEFAULT)
+    return generate_web_answer(question, results)
+
+
 def answer_question(question, doc_id, k=K_DEFAULT):
     collection = get_chroma_collection()
     hits = query_chroma(question, collection, n_results=k, doc_id=doc_id)
 
     if not hits:
-        return {
-            "answer": NOT_FOUND_MSG,
-            "sources": [],
-            "confidence": 0.0,
-            "grounded": False,
-        }
+        return _web_fallback(question)
 
     # top 3 average confidence
     top_n = hits[:3]
     avg_confidence = sum(h["score"] for h in top_n) / len(top_n)
 
-    # confidence gate 
+    # confidence gate
     if hits[0]["score"] < MIN_CONFIDENCE:
-        return {
-            "answer": NOT_FOUND_MSG,
-            "sources": [],
-            "confidence": avg_confidence,
-            "grounded": False,
-        }
+        return _web_fallback(question)
 
     context = build_context(hits)
     prompt = PROMPT_TEMPLATE.format(question=question, context=context)
     raw = _ollama(prompt).strip()
 
-    if not raw or raw == "NOT_IN_CONTEXT":
-        return {
-            "answer": NOT_FOUND_MSG,
-            "sources": [],
-            "confidence": avg_confidence,
-            "grounded": False,
-        }
+    if not raw or "NOT_IN_CONTEXT" in raw:
+        return _web_fallback(question)
 
     sources = _extract_cited_sources(raw, hits)
 
@@ -104,4 +227,5 @@ def answer_question(question, doc_id, k=K_DEFAULT):
         "sources": sources,
         "confidence": avg_confidence,
         "grounded": True,
+        "source_type": "document",
     }
