@@ -16,6 +16,8 @@ import sqlite3
 import requests
 import os
 from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
 
 GROQ_MODEL = "llama-3.3-70b-versatile"   
