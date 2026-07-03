@@ -52,16 +52,24 @@ def handle_query(question, doc_id, n_results=3):
 
     print("Answer:", result["answer"])
     print("Grounded:", result["grounded"])
-    print("Confidence:", round(result["confidence"], 3))
+    if result["confidence"] is not None:
+        print("Confidence:", round(result["confidence"], 3))
+    else:
+        print("Confidence: N/A (web result)")
+
     if result["sources"]:
         print("Sources:")
         for s in result["sources"]:
-            loc = f"page {s['page_start']}" + (
-                f"-{s['page_end']}" if s['page_end'] != s['page_start'] else ""
-            )
-            sect = f", {s['section']}" if s.get("section") else ""
-            print(f"  - {loc}{sect} ({s['type']}, score={s['score']:.2f})")
-
+            if s.get("type") == "web":
+                print(f"  - {s.get('title') or 'Untitled'} ({s.get('url')})")
+            else:
+                loc = f"page {s['page_start']}" + (
+                    f"-{s['page_end']}" if s['page_end'] != s['page_start'] else ""
+                )
+                sect = f", {s['section']}" if s.get("section") else ""
+                score = s.get("score")
+                score_str = f", score={score:.2f}" if score is not None else ""
+                print(f"  - {loc}{sect} ({s['type']}{score_str})")
 
 def main():
     parser = argparse.ArgumentParser(
