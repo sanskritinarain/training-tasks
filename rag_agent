@@ -130,6 +130,72 @@ def _filter_relevant_web_results(question, results, min_overlap=WEB_MIN_OVERLAP)
             kept.append(r)
     return kept
 
+REWRITE_PROMPT_TEMPLATE = """Given the conversation summary, the most recent conversation turns,
+and a follow-up question, rewrite the follow-up as a fully standalone question.
+
+Rules:
+- Resolve pronouns like "it", "they", "that model".
+- Resolve references like "Kerala", "that paper", "the second method", using the recent turns.
+- Preserve the user's original intent -- do not add new facts or assumptions.
+- Do NOT answer the question.
+- Return ONLY the rewritten standalone question, nothing else -- no preamble, no quotes.
+
+Conversation summary:
+{summary}
+
+Recent conversation:
+{recent_turns}
+
+Follow-up question: {question}
+
+Standalone question:"""
+
+
+def _format_recent_turns(messages, max_turns=2):
+    """Format the last max_turns (user, agent) pairs as plain text."""
+    if not messages:
+        return "(none)"
+    recent = messages[-(max_turns * 2):]
+    lines = []
+    for m in recent:
+        speaker = "User" if m["role"] == "user" else "Assistant"
+        lines.append(f"{speaker}: {m['content']}")
+    return "\n".join(lines) if lines else "(none)"
+
+
+def rewrite_standalone_question(question, rolling_summary, recent_messages=None):
+    if not rolling_summary:
+        return question
+
+    recent_turns = _format_recent_turns(recent_messages or [])
+    prompt = REWRITE_PROMPT_TEMPLATE.format(
+        summary=rolling_summary,
+        recent_turns=recent_turns,
+        question=question,
+    )
+    try:
+        rewritten = _ollama(prompt).strip()
+    except Exception:
+        return question
+
+    rewritten = rewritten.strip('"').strip("'").strip()
+
+    bad_prefixes = (
+        "answer:",
+        "standalone question:",
+        "rewritten question:",
+        "here is",
+        "here's",
+    )
+
+    if (
+        not rewritten
+        or len(rewritten) < 3
+        or rewritten.lower().startswith(bad_prefixes)
+    ):
+        return question
+
+    return rewritten
 
 def generate_web_answer(question, web_results):
  
@@ -187,29 +253,41 @@ def _web_fallback(question):
     results = web_search(question, k=WEB_K_DEFAULT)
     return generate_web_answer(question, results)
 
+def answer_question(question, doc_id, k=K_DEFAULT, rolling_summary=None, recent_messages=None):
+    if rolling_summary:
+        search_question = rewrite_standalone_question(question, rolling_summary, recent_messages)
+    else:
+        search_question = question
 
-def answer_question(question, doc_id, k=K_DEFAULT):
+    print(f"Original : {question}")
+    print(f"Searching: {search_question}")
+
     collection = get_chroma_collection()
-    hits = query_chroma(question, collection, n_results=k, doc_id=doc_id)
+    hits = query_chroma(search_question, collection, n_results=k, doc_id=doc_id)
+
+    # fallback: if rewrite hurt retrieval, retry with the original question
+    if search_question != question and (not hits or hits[0]["score"] < MIN_CONFIDENCE):
+        retry_hits = query_chroma(question, collection, n_results=k, doc_id=doc_id)
+        if retry_hits and (not hits or retry_hits[0]["score"] > hits[0]["score"]):
+            hits = retry_hits
+            search_question = question
+            print(f"Fallback to original question (better retrieval): {search_question}")
 
     if not hits:
-        return _web_fallback(question)
+        return _web_fallback(search_question)
 
-    # top 3 average confidence
     top_n = hits[:3]
     avg_confidence = sum(h["score"] for h in top_n) / len(top_n)
 
-    # confidence gate
     if hits[0]["score"] < MIN_CONFIDENCE:
-        return _web_fallback(question)
+        return _web_fallback(search_question)
 
     context = build_context(hits)
-    prompt = PROMPT_TEMPLATE.format(question=question, context=context)
+    prompt = PROMPT_TEMPLATE.format(question=search_question, context=context)
     raw = _ollama(prompt).strip()
 
     if not raw or "NOT_IN_CONTEXT" in raw:
-        return _web_fallback(question)
-
+        return _web_fallback(search_question)
     sources = _extract_cited_sources(raw, hits)
 
     if not sources:
