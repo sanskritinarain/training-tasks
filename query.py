@@ -56,6 +56,10 @@ def handle_query(question, doc_id, n_results=3, conversation_id=None, db_path="c
 
     conversation_id = _resolve_conversation(conversation_id, doc_id, db_path=db_path)
 
+    convo_state = get_conversation(conversation_id, db_path=db_path)
+    rolling_summary = convo_state.get("rolling_summary") if convo_state else None
+    recent_messages = convo_state.get("messages", []) if convo_state else []
+
     question_lower = question.lower()
 
     is_shortcut = False
@@ -76,43 +80,41 @@ def handle_query(question, doc_id, n_results=3, conversation_id=None, db_path="c
 
     else:
         try:
-            result = generate_answer(question, doc_id, k=n_results)
+            result = generate_answer(
+                question, doc_id, k=n_results,
+                rolling_summary=rolling_summary,
+                recent_messages=recent_messages,
+            )
+            answer_text = result["answer"]
+            sources = result["sources"]
+            source_type = result["source_type"]
+
+            print("Answer:", result["answer"])
+            print("Grounded:", result["grounded"])
+            if result["confidence"] is not None:
+                print("Confidence:", round(result["confidence"], 3))
+            else:
+                print("Confidence: N/A")
+
+            if result["sources"]:
+                print("Sources:")
+                for s in result["sources"]:
+                    if s.get("type") == "web":
+                        print(f"  - {s.get('title') or 'Untitled'} ({s.get('url')})")
+                    else:
+                        loc = f"page {s['page_start']}" + (
+                            f"-{s['page_end']}" if s['page_end'] != s['page_start'] else ""
+                        )
+                        sect = f", {s['section']}" if s.get("section") else ""
+                        score = s.get("score")
+                        score_str = f", score={score:.2f}" if score is not None else ""
+                        print(f"  - {loc}{sect} ({s['type']}{score_str})")
         except Exception as e:
-            result = {
-                "answer": f"Error: {e}",
-                "grounded": False,
-                "confidence": None,
-                "sources": [],
-                "source_type": "error",
-            }
-
-        answer_text = result["answer"]
-        sources = result["sources"]
-        source_type = result["source_type"]
-
-        print("Answer:", result["answer"])
-        print("Grounded:", result["grounded"])
-        if result["confidence"] is not None:
-            print("Confidence:", round(result["confidence"], 3))
-        else:
-            print("Confidence: N/A")
-
-        if result["sources"]:
-            print("Sources:")
-            for s in result["sources"]:
-                if s.get("type") == "web":
-                    print(f"  - {s.get('title') or 'Untitled'} ({s.get('url')})")
-                else:
-                    loc = f"page {s['page_start']}" + (
-                        f"-{s['page_end']}" if s['page_end'] != s['page_start'] else ""
-                    )
-                    sect = f", {s['section']}" if s.get("section") else ""
-                    score = s.get("score")
-                    score_str = f", score={score:.2f}" if score is not None else ""
-                    print(f"  - {loc}{sect} ({s['type']}{score_str})")
+            print(f"Error generating answer: {e}")
+            return None
 
     try:
-        add_message(conversation_id, "user", question, sources=None, source_type=source_type, db_path=db_path)
+        add_message(conversation_id, "user", question, sources=None, source_type="user", db_path=db_path)
         add_message(conversation_id, "agent", answer_text, sources=sources, source_type=source_type, db_path=db_path)
     except Exception as e:
         print(f"Warning: failed to save conversation: {e}")
