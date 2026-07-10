@@ -22,6 +22,7 @@ load_dotenv()
 
 GROQ_MODEL = "llama-3.3-70b-versatile"   
 _groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+SHORT_DOC_LIMIT = 6000
 
 
 def _ollama(prompt: str, model: str = None) -> str:
@@ -282,7 +283,7 @@ def store_chunks_db(chunks):
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
 
-    # Create table with doc_id
+    # table with doc_id
     cursor.execute("""
 CREATE TABLE IF NOT EXISTS chunks(
     chunk_id TEXT PRIMARY KEY,
@@ -402,6 +403,67 @@ def normalize_for_comparison(text):
     t = re.sub(r"\d+", "#", t)
     t = re.sub(r"\s+", " ", t)
     return t
+
+
+def _is_title_case(text):
+    words = text.split()
+    if not words:
+        return False
+    for w in words:
+        core = re.sub(r"[^A-Za-z]", "", w)
+        if not core:
+            continue
+        if core.isupper():         
+            continue
+        if not core[0].isupper():
+            return False
+    return True
+
+_CAPTION_RE = re.compile(r"^(TABLE|FIG(?:URE)?\.?|ALGORITHM|EQ(?:UATION)?\.?)\s*[\dIVXLC]+\b", re.IGNORECASE)
+
+def _is_caption(text):
+  
+    return bool(_CAPTION_RE.match(text.strip()))
+
+
+def _classify_heading_level(text):
+    if re.match(r"^[IVX]+\.\s+[A-Za-z]", text):
+        return "major"
+    if re.match(r"^[A-Z]\.\s+[A-Za-z]", text):
+        return "minor"
+    if re.match(r"^\d+\.\d", text):
+        return "minor"
+    if re.match(r"^\d+\.?\s+[A-Za-z]", text):
+        return "major"
+    if text.isupper() and len(text.split()) <= 8:
+        return "major"
+    return "minor"
+
+
+def is_likely_heading(text, line_size, body_size, is_bold):
+    if not text or len(text.split()) > 8:
+        return False
+    
+    if _is_caption(text):         
+        return False
+
+    size_signal      = body_size is not None and (line_size - body_size) >= 1.5
+    numbered_signal   = bool(re.match(r"^\d+(\.\d+){0,2}\.?\s+[A-Za-z]", text))
+    roman_signal      = bool(re.match(r"^[IVX]+\.\s+[A-Za-z]", text))
+    letter_signal     = bool(re.match(r"^[A-Z]\.\s+[A-Za-z]", text))
+    all_caps_signal   = text.isupper() and len(text.split()) <= 8
+    title_case_signal = _is_title_case(text) and len(text.split()) <= 8
+
+    score = 0
+    if size_signal:      score += 1
+    if is_bold:           score += 1
+    if numbered_signal:   score += 2
+    if roman_signal:      score += 2
+    if letter_signal:     score += 2
+    if all_caps_signal:   score += 2
+    if title_case_signal: score += 1
+
+    return score >= 3
 
 
 # HEADER FOOTER STRIP
@@ -661,25 +723,40 @@ def extract_authors(doc):
 
 # LINE EXTRACTION WITH HEADING DETECTION
 
-def extract_lines_with_metadata(doc, table_bboxes=None, body_size_threshold_delta=1.5):
+def extract_lines_with_metadata(doc, table_bboxes=None, title_text=None):
     if table_bboxes is None:
         table_bboxes = {}
 
-    pages = []
+    all_sizes = []
+    for page in doc:
+        for block in page.get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    if span["text"].strip():
+                        all_sizes.append(round(span["size"], 1))
+    body_size = max(set(all_sizes), key=all_sizes.count) if all_sizes else None
 
+    title_norm = normalize_for_comparison(title_text) if title_text else None
+
+    gate_patterns = ("abstract", "introduction", "background", "motivation")
+    content_started = False  
+
+    pages = []
     for page_index, page in enumerate(doc):
         page_number = page_index + 1
         page_table_bboxes = table_bboxes.get(page_number, [])
         blocks = page.get_text("dict")["blocks"]
-        sizes = []
 
-        for block in blocks:
-            for line in block.get("lines", []):
-                for span in line["spans"]:
-                    if span["text"].strip():
-                        sizes.append(round(span["size"], 1))
+       
+        mid_x = page.rect.width / 2
 
-        body_size = max(set(sizes), key=sizes.count) if sizes else None
+        def _col_sort_key(block):
+            bx0, by0, bx1, by1 = block["bbox"]
+            center = (bx0 + bx1) / 2
+            col = 0 if center < mid_x else 1   
+            return (col, by0)                   
+
+        blocks = sorted(blocks, key=_col_sort_key)
 
         page_lines = []
         for block in blocks:
@@ -698,51 +775,92 @@ def extract_lines_with_metadata(doc, table_bboxes=None, body_size_threshold_delt
                 text = "".join(s["text"] for s in line["spans"]).strip()
                 if not text:
                     continue
-                line_size = max(s["size"] for s in line["spans"])
+
+                spans = line["spans"]
+                line_size = max(s["size"] for s in spans)
+                is_bold = any(
+                    "bold" in s.get("font", "").lower()
+                    for s in spans
+                )
+
+                norm = normalize_for_comparison(text)
+
+                
+                is_title_line = (
+                    page_number == 1
+                    and title_norm
+                    and norm in title_norm
+                )
+
+                if not content_started:
+                    if any(p in norm for p in gate_patterns):
+                        content_started = True
+                    elif page_number >= 3:
+                      
+                        content_started = True
 
                 is_heading = (
-                    body_size is not None
-                    and line_size - body_size >= body_size_threshold_delta
-                    and len(text.split()) <= 15
+                    not is_title_line
+                    and content_started
+                    and is_likely_heading(text, line_size, body_size, is_bold)
                 )
+
+                heading_level = _classify_heading_level(text) if is_heading else None
 
                 page_lines.append({
                     "text": normalize_chars(text),
                     "page": page_number,
                     "is_heading": is_heading,
+                    "heading_level": heading_level,
                 })
 
         pages.append(page_lines)
 
     return pages
 
-
 # WORD EXTRACTION WITH METADATA
 
-def extract_words_with_metadata(doc, table_bboxes=None, body_size_threshold_delta=1.5):
-    pages = extract_lines_with_metadata(doc, table_bboxes, body_size_threshold_delta)
+def extract_words_with_metadata(doc, table_bboxes=None, title_text=None):
+    pages = extract_lines_with_metadata(doc, table_bboxes, title_text=title_text)
     pages = strip_repeated_headers_footers(pages)
     flat_lines = [line for page in pages for line in page]
     flat_lines = join_hyphenated_breaks(flat_lines)
 
     tagged_words = []
-    current_heading = None
+    current_major = None
+    current_minor = None
+
     for line in flat_lines:
-        if line["is_heading"]:
-            current_heading = line["text"]
-        for word in line["text"].split():
-            tagged_words.append((word, line["page"], current_heading))
+        text = line["text"]
+
+        # synthetic sections 
+        if re.match(r"^abstract\s*[-—]", text, re.IGNORECASE):
+            current_major, current_minor = "Abstract", None
+        elif re.match(r"^index terms\s*[-—]", text, re.IGNORECASE):
+            current_major, current_minor = "Index Terms", None
+        elif line["is_heading"]:
+            if line["heading_level"] == "major":
+                current_major = text
+                current_minor = None         
+            else:
+                current_minor = text
+
+        combined = current_major
+        if current_minor:
+            combined = f"{current_major} > {current_minor}" if current_major else current_minor
+
+        for word in text.split():
+            tagged_words.append((word, line["page"], combined))
 
     return tagged_words
 
-
 # DIGITAL TEXT CHUNKING
 
-def extract_text(doc, pdf_path, table_bboxes=None, chunk_size=400, overlap=50):
+def extract_text(doc, pdf_path, table_bboxes=None, chunk_size=400, overlap=50, title_text=None):
     if overlap >= chunk_size:
         raise ValueError("overlap must be less than chunk_size")
 
-    tagged_words = extract_words_with_metadata(doc, table_bboxes)
+    tagged_words = extract_words_with_metadata(doc, table_bboxes, title_text=title_text)
     full_text = " ".join(w for w, _, _ in tagged_words)
 
     step = chunk_size - overlap
@@ -864,11 +982,10 @@ def _words_to_grid(words, col_gap=15, row_gap=4):
 
 
 def _bboxes_overlap(b1, b2, tolerance=20):
-    """Check if two bboxes refer to the same table region."""
-    # Check if corners are close
+  
     if abs(b1[0] - b2[0]) < tolerance and abs(b1[1] - b2[1]) < tolerance:
         return True
-    # Check if vertical ranges significantly overlap (same horizontal region)
+    # Check if vertical ranges overlap 
     y_overlap = max(0, min(b1[3], b2[3]) - max(b1[1], b2[1]))
     y_range = max(b1[3] - b1[1], b2[3] - b2[1], 1)
     if y_overlap / y_range > 0.5:
@@ -881,10 +998,7 @@ def _bboxes_overlap(b1, b2, tolerance=20):
 
 
 def _find_line_bounded_tables(page, min_lines=2):
-    """
-    Find tables by detecting groups of horizontal lines that bound table regions.
-    Works for IEEE-style tables with only horizontal rules.
-    """
+    
     mid_x = page.width / 2
     h_lines = [
         l for l in page.lines
@@ -913,7 +1027,7 @@ def _find_line_bounded_tables(page, min_lines=2):
         if len(lines) < min_lines:
             continue
         lines = sorted(lines, key=lambda l: l["top"])
-        # Cluster lines that are within 80pt of each other vertically
+        # Cluster lines 
         clusters = []
         current = [lines[0]]
         for l in lines[1:]:
@@ -927,11 +1041,11 @@ def _find_line_bounded_tables(page, min_lines=2):
         for cluster in clusters:
             if len(cluster) < min_lines:
                 continue
-            # Build crop box from the line cluster
+            
             x0 = min(l["x0"] for l in cluster) - 2
             x1 = max(l["x1"] for l in cluster) + 2
             y0 = min(l["top"] for l in cluster) - 4
-            y1 = max(l["top"] for l in cluster) + 25  # padding below last line
+            y1 = max(l["top"] for l in cluster) + 25 
 
             try:
                 crop = page.crop((x0, y0, x1, y1))
@@ -946,7 +1060,7 @@ def _find_line_bounded_tables(page, min_lines=2):
             if len(raw_lines) < 2:
                 continue
 
-            # Split each line into columns by 2+ spaces
+            
             rows = [re.split(r"  +", ln) for ln in raw_lines]
             col_counts = [len(r) for r in rows]
             # If 2+ space split doesn't work, try single space
@@ -956,11 +1070,11 @@ def _find_line_bounded_tables(page, min_lines=2):
             if max(len(r) for r in rows) < 2:
                 continue
 
-            # Trim trailing rows that look like body text (not table data)
+           
             while len(rows) > 2:
                 last_row = rows[-1]
                 text_in_row = " ".join(last_row)
-                # If the row has many words and few numbers, it's likely prose
+           
                 words = text_in_row.split()
                 num_count = sum(1 for w in words if re.match(r"^[\d.+\-∆]+$", w))
                 if len(words) > 5 and num_count == 0:
@@ -1011,18 +1125,18 @@ def _try_split_single_col_table(rows):
     ncols = max(len(r) for r in rows)
     if ncols != 1:
         return rows
-    # Try splitting each row by 2+ spaces first, then by single spaces
+    
     for sep_pattern in [r"  +", r" +"]:
         split_rows = []
         for row in rows:
             cell = row[0] if row else ""
             parts = re.split(sep_pattern, cell)
             split_rows.append(parts)
-        # Check if most non-empty rows have 2+ columns
+        
         col_counts = [len(r) for r in split_rows if any(c.strip() for c in r)]
         if not col_counts:
             continue
-        # Accept if all non-empty rows have at least 2 cols
+        
         if min(col_counts) >= 2:
             return split_rows
     return rows
@@ -1045,7 +1159,7 @@ def _extract_word_layout_tables(page, col_gap=15, row_gap=6, min_cols=2, min_row
     if not words:
         return []
 
-    # Group words into horizontal bands
+   
     band_map = defaultdict(list)
     for w in words:
         band_map[round(w["top"] / row_gap)].append(w)
@@ -1064,7 +1178,7 @@ def _extract_word_layout_tables(page, col_gap=15, row_gap=6, min_cols=2, min_row
                     region.append(bands[j])
                     j += 1
                 else:
-                    # Allow 1 sparse row (e.g. a sub-header or merged cell)
+                    
                     if j + 1 < len(bands):
                         xs_skip = _cluster_values([w["x0"] for w in bands[j+1]], gap=col_gap)
                         if len(xs_skip) >= min_cols:
@@ -1116,7 +1230,7 @@ def extract_tables_and_bboxes(pdf_path):
                     if _looks_like_table(rows):
                         _register(t.bbox, rows)
 
-                # Strategy 2 — horizontal lines + text columns (IEEE-style tables)
+                # Strategy 2 — horizontal lines + text columns 
                 for t in page.find_tables(TABLE_SETTINGS_HLINES):
                     rows = _expand_multiline_cells(t.extract())
                     if _looks_like_table(rows):
@@ -1214,7 +1328,7 @@ def main(pdf_path: Optional[str] = None) -> Optional[dict]:
 
     ocr_used = False
     if is_digital:
-        text, chunks = extract_text(doc, pdf_path, table_bboxes, chunk_size=400, overlap=50)
+        text, chunks = extract_text(doc, pdf_path, table_bboxes, chunk_size=400, overlap=50, title_text=title)
     else:
         print("PDF appears to be scanned — running OCR...")
         page_texts = ocr_extract_text(doc, dpi=300)
