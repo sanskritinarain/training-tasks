@@ -5,7 +5,7 @@ from web_search import web_search
 # CONFIG
 K_DEFAULT = 5
 WEB_K_DEFAULT = 3
-MIN_CONFIDENCE = 0.35
+MIN_CONFIDENCE = 0.15
 WEB_MIN_OVERLAP = 0.15
 WEB_NOT_FOUND_MSG = "I couldn't find reliable information on the web."
 
