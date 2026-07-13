@@ -1,38 +1,80 @@
-+ def _is_caption(text):
-+     """TABLE IV, Fig. 3, Algorithm 1 etc — reject as headings."""
-+     return bool(_CAPTION_RE.match(text.strip()))
-+
-+ def _classify_heading_level(text):
-+     """Roman/ALL-CAPS = major section, lettered/decimal = minor subsection."""
-+     ...
+import re
+from tsk1 import query_chroma, get_chroma_collection, _ollama
 
-  def is_likely_heading(text, line_size, body_size, is_bold):
-      if not text or len(text.split()) > 8:
-          return False
-+     if _is_caption(text):
-+         return False
-      ...
+# CONFIG
+K_DEFAULT = 5
+NOT_FOUND_MSG = "I couldn't find this in the document."
 
-- def extract_lines_with_metadata(doc, table_bboxes=None, body_size_threshold_delta=1.5):
-+ def extract_lines_with_metadata(doc, table_bboxes=None, title_text=None):
-      if table_bboxes is None:
-          table_bboxes = {}
-+
-+     # doc-wide body size instead of per-page
-+     all_sizes = [...]
-+     body_size = max(set(all_sizes), key=all_sizes.count) if all_sizes else None
-+
-+     title_norm = normalize_for_comparison(title_text) if title_text else None
-+     content_started = False
+PROMPT_TEMPLATE = """You are a research assistant. Answer the question using ONLY the sources below.
+Cite the sources you use with their number, like [Source 2].
+If the answer is not in the sources, reply exactly: "NOT_IN_CONTEXT".
+Do not use outside knowledge.
 
-      for page_index, page in enumerate(doc):
-          ...
-          blocks = page.get_text("dict")["blocks"]
-+
-+         # column-aware sort — fixes 2-column reading order
-+         mid_x = page.rect.width / 2
-+         blocks = sorted(blocks, key=_col_sort_key)
+Question: {question}
 
-          for block in blocks:
-              ...
-              for line in block["lines"]:
+Sources:
+{context}
+
+Answer:"""
+
+
+def build_context(hits):
+    blocks = []
+    for i, h in enumerate(hits, 1):
+        m = h["meta"]
+        loc = f"page {m['page_start']}" + (
+            f"-{m['page_end']}" if m['page_end'] != m['page_start'] else ""
+        )
+        sect = f", {m['section_heading']}" if m.get("section_heading") else ""
+        blocks.append(f"[Source {i} | {loc}{sect}]\n{h['text']}")
+    return "\n\n".join(blocks)
+
+
+def _extract_cited_sources(answer_text, hits):
+    cited_nums = sorted(set(int(n) for n in re.findall(r"\[Source (\d+)\]", answer_text)))
+    sources = []
+    for n in cited_nums:
+        if 1 <= n <= len(hits):
+            m = hits[n - 1]["meta"]
+            sources.append({
+                "page_start": m["page_start"],
+                "page_end": m["page_end"],
+                "section": m.get("section_heading"),
+                "type": m.get("type"),
+                "score": hits[n - 1]["score"],
+            })
+    return sources
+
+
+def answer_question(question, doc_id, k=K_DEFAULT):
+    collection = get_chroma_collection()
+    hits = query_chroma(question, collection, n_results=k, doc_id=doc_id)
+
+    if not hits:
+        return {
+            "answer": NOT_FOUND_MSG,
+            "sources": [],
+            "confidence": 0.0,
+            "grounded": False,
+        }
+
+    context = build_context(hits)
+    prompt = PROMPT_TEMPLATE.format(question=question, context=context)
+    raw = _ollama(prompt).strip()
+
+    if not raw or raw == "NOT_IN_CONTEXT":
+        return {
+            "answer": NOT_FOUND_MSG,
+            "sources": [],
+            "confidence": hits[0]["score"],
+            "grounded": False,
+        }
+
+    sources = _extract_cited_sources(raw, hits)
+
+    return {
+        "answer": raw,
+        "sources": sources,
+        "confidence": hits[0]["score"],
+        "grounded": True,
+    }
