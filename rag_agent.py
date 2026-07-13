@@ -306,3 +306,5 @@ def answer_question(question, doc_id, k=K_DEFAULT, rolling_summary=None, recent_
         "grounded": True,
         "source_type": "document",
     }
+
+def broken(:
