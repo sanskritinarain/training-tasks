@@ -26,7 +26,6 @@ Sources:
 
 Direct Answer:"""
 
-
 WEB_PROMPT_TEMPLATE = """You are a research assistant. Answer the question using ONLY the web search results below.
 
 Rules:
@@ -35,6 +34,7 @@ Rules:
 - Give a longer answer only if the user explicitly asks for more detail.
 - Cite the source number like [Web 2].
 - If the results disagree, note the disagreement briefly instead of picking one side silently.
+- Never combine specific facts, numbers, steps, or details from different sources into a single unified answer unless one source actually states that exact combination. Each specific claim (a number, a date, a step, a measurement, a name) must come from one identifiable source. If different sources give different specifics for the same question, attribute each specific to its own source rather than blending them into one version.
 - Answer ONLY using the information present in the web search snippets below. Do not use your own knowledge.
 - If truly no relevant information exists in these results, reply exactly: "NOT_IN_CONTEXT".
 
@@ -44,7 +44,6 @@ Web Results:
 {context}
 
 Direct Answer:"""
-
 
 def build_context(hits):
     blocks = []
