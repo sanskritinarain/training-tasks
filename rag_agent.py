@@ -1,5 +1,5 @@
 import re
-from task_1 import query_chroma, get_chroma_collection, _ollama
+import task_1
 from web_search import web_search
 
 # CONFIG
@@ -111,7 +111,7 @@ _STOPWORDS = {
 
 
 def _keyword_overlap(question, text):
-    """Fraction of non-stopword question terms that appear in text (case-insensitive)."""
+   
     q_words = {w.strip(".,?!'\"") for w in question.lower().split()} - _STOPWORDS
     if not q_words:
         return 1.0  
@@ -173,7 +173,7 @@ def rewrite_standalone_question(question, rolling_summary, recent_messages=None)
         question=question,
     )
     try:
-        rewritten = _ollama(prompt).strip()
+        rewritten = task_1.llm(prompt).strip()
     except Exception:
         return question
 
@@ -223,7 +223,7 @@ def generate_web_answer(question, web_results):
 
     context = build_web_context(web_results)
     prompt = WEB_PROMPT_TEMPLATE.format(question=question, context=context)
-    raw = _ollama(prompt).strip()
+    raw = task_1.groq(prompt).strip()
     if not raw or "NOT_IN_CONTEXT" in raw:
         return {
             "answer": WEB_NOT_FOUND_MSG,
@@ -261,12 +261,12 @@ def answer_question(question, doc_id, k=K_DEFAULT, rolling_summary=None, recent_
     print(f"Original : {question}")
     print(f"Searching: {search_question}")
 
-    collection = get_chroma_collection()
-    hits = query_chroma(search_question, collection, n_results=k, doc_id=doc_id)
+    collection = task_1.get_chroma_collection()
+    hits = task_1.query_chroma(search_question, collection, n_results=k, doc_id=doc_id)
 
-    # fallback: if rewrite hurt retrieval, retry with the original question
+
     if search_question != question and (not hits or hits[0]["score"] < MIN_CONFIDENCE):
-        retry_hits = query_chroma(question, collection, n_results=k, doc_id=doc_id)
+        retry_hits = task_1.query_chroma(question, collection, n_results=k, doc_id=doc_id)
         if retry_hits and (not hits or retry_hits[0]["score"] > hits[0]["score"]):
             hits = retry_hits
             search_question = question
@@ -283,7 +283,7 @@ def answer_question(question, doc_id, k=K_DEFAULT, rolling_summary=None, recent_
 
     context = build_context(hits)
     prompt = PROMPT_TEMPLATE.format(question=search_question, context=context)
-    raw = _ollama(prompt).strip()
+    raw = task_1.llm(prompt).strip()
 
     if not raw or "NOT_IN_CONTEXT" in raw:
         return _web_fallback(search_question)
