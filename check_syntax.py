@@ -1,4 +1,3 @@
-"""Guardrail: verify all project .py files are syntactically valid before committing."""
 import ast
 import sys
 
