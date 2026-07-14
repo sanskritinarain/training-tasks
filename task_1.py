@@ -13,20 +13,17 @@ from PIL import Image
 import chromadb
 from sentence_transformers import SentenceTransformer
 import sqlite3
-import requests
-import os
 from groq import Groq
 from dotenv import load_dotenv
+
+
 load_dotenv()
-
-
 GROQ_MODEL = "llama-3.3-70b-versatile"   
 _groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 SHORT_DOC_LIMIT = 6000
 
 
-def _ollama(prompt: str, model: str = None) -> str:
-    """Kept the name `_ollama` so rag_agent.py doesn't need any other changes."""
+def llm(prompt: str, model: str = None) -> str:
     try:
         resp = _groq_client.chat.completions.create(
             model=GROQ_MODEL,
@@ -71,7 +68,7 @@ Document:
 {text}
 
 JSON:"""
-    raw = _ollama(prompt)
+    raw = llm(prompt)
     return _parse_summary_json(raw)
 
 
@@ -84,7 +81,7 @@ Section:
 {chunk_text}
 
 Summary:"""
-    return _ollama(prompt)
+    return llm(prompt)
 
 
 def _summarize_reduce(partial_summaries: list[str], title: str = "") -> dict:
@@ -103,7 +100,7 @@ def _summarize_reduce(partial_summaries: list[str], title: str = "") -> dict:
 
 Combined Summary:"""
             print(f"  Batch reducing {i//BATCH_SIZE + 1}...")
-            result = _ollama(prompt)
+            result = llm(prompt)
             if result:
                 batched.append(result)
         partial_summaries = batched
@@ -125,7 +122,7 @@ Section Summaries:
 {combined}
 
 JSON:"""
-    raw = _ollama(prompt)
+    raw = llm(prompt)
     return _parse_summary_json(raw)
 
     
@@ -155,7 +152,7 @@ _embedder = None
 def get_embedder():
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  # fast, 384-dim
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  
     return _embedder
 
 
