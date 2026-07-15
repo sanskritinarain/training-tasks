@@ -275,8 +275,7 @@ def answer_question(question, doc_id, k=K_DEFAULT, rolling_summary=None, recent_
     if not hits:
         return _web_fallback(search_question)
 
-    top_n = hits[:3]
-    avg_confidence = sum(h["score"] for h in top_n) / len(top_n)
+    confidence = hits[0]["score"]
 
     if hits[0]["score"] < MIN_CONFIDENCE:
         return _web_fallback(search_question)
@@ -302,7 +301,7 @@ def answer_question(question, doc_id, k=K_DEFAULT, rolling_summary=None, recent_
     return {
         "answer": raw,
         "sources": sources,
-        "confidence": avg_confidence,
+        "confidence": confidence,
         "grounded": True,
         "source_type": "document",
     }
