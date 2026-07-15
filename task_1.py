@@ -13,25 +13,43 @@ from PIL import Image
 import chromadb
 from sentence_transformers import SentenceTransformer
 import sqlite3
+import os
 from groq import Groq
 from dotenv import load_dotenv
 
-
 load_dotenv()
-GROQ_MODEL = "llama-3.3-70b-versatile"   
-_groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-SHORT_DOC_LIMIT = 6000
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+_groq_client = None
+
+
+def _get_groq_client():
+    global _groq_client
+
+    if _groq_client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY environment variable is not set."
+            )
+
+        _groq_client = Groq(api_key=api_key)
+
+    return _groq_client
 
 
 def llm(prompt: str, model: str = None) -> str:
     try:
-        resp = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
+        client = _get_groq_client()
+
+        resp = client.chat.completions.create(
+            model=model or GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=500,
         )
         return resp.choices[0].message.content.strip()
+
     except Exception as e:
         print(f"Groq error: {e}")
         return ""
@@ -261,17 +279,33 @@ def store_document_record(doc_id, doc_name, title, authors, page_count,
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
     cursor.execute("""
-INSERT OR REPLACE INTO documents (
+INSERT INTO documents (
     doc_id, doc_name, title, authors, page_count,
     word_count, chunk_count, table_count, figure_count, summary
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(doc_id) DO UPDATE SET
+    doc_name = excluded.doc_name,
+    title = excluded.title,
+    authors = excluded.authors,
+    page_count = excluded.page_count,
+    word_count = excluded.word_count,
+    chunk_count = excluded.chunk_count,
+    table_count = excluded.table_count,
+    figure_count = excluded.figure_count,
+    summary = excluded.summary;
 """, (
-        doc_id, doc_name, title,
-        json.dumps(authors),  
-        page_count, word_count, chunk_count,
-        table_count, figure_count,
-        json.dumps(summary)    
-    ))
+    doc_id,
+    doc_name,
+    title,
+    json.dumps(authors),
+    page_count,
+    word_count,
+    chunk_count,
+    table_count,
+    figure_count,
+    json.dumps(summary),
+))
     conn.commit()
     conn.close()
 
@@ -328,6 +362,7 @@ INSERT OR REPLACE INTO chunks (
         ))
 
     conn.commit()
+    conn.close()
     
 # SCAN OR DIGITAL
 
@@ -402,6 +437,7 @@ def normalize_for_comparison(text):
     return t
 
 
+# TITLE CASE DETECTION
 def _is_title_case(text):
     words = text.split()
     if not words:
@@ -437,6 +473,7 @@ def _classify_heading_level(text):
     return "minor"
 
 
+# sECTION HEADING DETECTION
 def is_likely_heading(text, line_size, body_size, is_bold):
     if not text or len(text.split()) > 8:
         return False
