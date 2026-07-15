@@ -1,7 +1,9 @@
+import os
 import sqlite3
 import json
-import uuid
-
+import hashlib
+import time
+import tempfile
 
 def _connect(db_path="chunks.db"):
     conn = sqlite3.connect(db_path)
@@ -41,9 +43,24 @@ def init_conversation_tables(db_path="chunks.db"):
 
 def create_conversation(doc_id, db_path="chunks.db"):
     init_conversation_tables(db_path)
-    conversation_id = uuid.uuid4().hex[:12]
     conn = _connect(db_path)
     cursor = conn.cursor()
+    conversation_id = None
+    for _ in range(5):
+        raw = f"{doc_id}_{time.time_ns()}"
+        candidate_id = hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+        cursor.execute(
+            "SELECT 1 FROM conversations WHERE conversation_id = ?",
+            (candidate_id,)
+        )
+        if cursor.fetchone() is None:
+            conversation_id = candidate_id
+            break
+
+    if conversation_id is None:
+        conn.close()
+        raise RuntimeError("Could not create a unique conversation id")
+
     cursor.execute(
         "INSERT INTO conversations (conversation_id, doc_id, rolling_summary) VALUES (?, ?, ?)",
         (conversation_id, doc_id, None)
@@ -176,9 +193,21 @@ def update_rolling_summary(conversation_id, ollama_fn, doc_title="", db_path="ch
 
 
 if __name__ == "__main__":
-    # Smoke test
-    test_db = "chunks.db"
-    cid = create_conversation("f62eee6c88a0", db_path=test_db)
-    add_message(cid, "user", "What is the RMSE for Kerala?", db_path=test_db)
-    add_message(cid, "agent", "Kerala's RMSE is 4.2", sources=[{"type": "document", "page_start": 5}], source_type="document", db_path=test_db)
-    print(get_conversation(cid, db_path=test_db))
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        test_db = f.name
+
+    try:
+        cid = create_conversation("f62eee6c88a0", db_path=test_db)
+        add_message(cid, "user", "What is the RMSE for Kerala?", db_path=test_db)
+        add_message(
+            cid,
+            "agent",
+            "Kerala's RMSE is 4.2",
+            sources=[{"type": "document", "page_start": 5}],
+            source_type="document",
+            db_path=test_db,
+        )
+
+        print(get_conversation(cid, db_path=test_db))
+    finally:
+        os.remove(test_db)
