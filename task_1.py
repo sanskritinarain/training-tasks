@@ -474,7 +474,7 @@ def _classify_heading_level(text):
     return "minor"
 
 
-# sECTION HEADING DETECTION
+# SECTION HEADING DETECTION
 def is_likely_heading(text, line_size, body_size, is_bold):
     if not text or len(text.split()) > 8:
         return False
@@ -1147,12 +1147,6 @@ def _expand_multiline_cells(rows):
     return expanded
 
 
-def _split_text_to_columns(text):
-   
-    parts = text.split()
-    return parts
-
-
 def _try_split_single_col_table(rows):
     
     if not rows:
@@ -1187,58 +1181,6 @@ def _make_table_chunk(pdf_path, text, page_number):
         "section_heading": None,
         "type":            "table",
     }
-
-def _extract_word_layout_tables(page, col_gap=15, row_gap=6, min_cols=2, min_rows=2, max_rows=15):
-    
-    words = page.extract_words(x_tolerance=3, y_tolerance=3)
-    if not words:
-        return []
-
-   
-    band_map = defaultdict(list)
-    for w in words:
-        band_map[round(w["top"] / row_gap)].append(w)
-    bands = [band_map[k] for k in sorted(band_map)]
-
-    results = []
-    i = 0
-    while i < len(bands):
-        xs = _cluster_values([w["x0"] for w in bands[i]], gap=col_gap)
-        if len(xs) >= min_cols:
-            region = [bands[i]]
-            j = i + 1
-            while j < len(bands):
-                xs_next = _cluster_values([w["x0"] for w in bands[j]], gap=col_gap)
-                if len(xs_next) >= min_cols:
-                    region.append(bands[j])
-                    j += 1
-                else:
-                    
-                    if j + 1 < len(bands):
-                        xs_skip = _cluster_values([w["x0"] for w in bands[j+1]], gap=col_gap)
-                        if len(xs_skip) >= min_cols:
-                            region.append(bands[j])
-                            region.append(bands[j+1])
-                            j += 2
-                            continue
-                    break
-
-            if min_rows <= len(region) <= max_rows:
-                all_words = [w for band in region for w in band]
-                bbox = (
-                    min(w["x0"]     for w in all_words) - 2,
-                    min(w["top"]    for w in all_words) - 2,
-                    max(w["x1"]     for w in all_words) + 2,
-                    max(w["bottom"] for w in all_words) + 2,
-                )
-                rows = _words_to_grid(all_words, col_gap=col_gap, row_gap=row_gap)
-                if _looks_like_table(rows, max_rows=max_rows):
-                    results.append((bbox, rows))
-            i = j
-        else:
-            i += 1
-
-    return results
 
 
 def extract_tables_and_bboxes(pdf_path):
@@ -1294,12 +1236,6 @@ def extract_tables_and_bboxes(pdf_path):
                 for bbox, rows in _find_line_bounded_tables(page):
                     if _looks_like_table(rows):
                         _register(bbox, rows)
-
-                # Strategy 3 — word clustering for borderless tables
-                # (disabled for double-column PDFs — causes over-detection)
-                # if not page_bboxes:
-                #     for bbox, rows in _extract_word_layout_tables(page):
-                #         _register(bbox, rows)
 
                 if page_bboxes:
                     bboxes[page_number] = page_bboxes
