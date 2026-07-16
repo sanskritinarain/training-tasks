@@ -1,9 +1,8 @@
 import argparse
-import re
 import json
 import sqlite3
 from rag_agent import answer_question as generate_answer
-from task_1 import _ollama
+from task_1 import llm
 from conversation_store import (
     create_conversation,
     get_conversation,
@@ -11,36 +10,6 @@ from conversation_store import (
     update_rolling_summary,
 )
 
-def normalize(q):
-    return re.sub(r"[^\w\s]", "", q.lower()).strip()
-
-
-AUTHOR_QUERIES = {
-    "who wrote this",
-    "who wrote the paper",
-    "who is the author",
-    "who are the authors",
-    "author of this paper",
-    "author of the paper",
-}
-
-TITLE_QUERIES = {
-    "what is the title",
-    "whats the title",
-    "title of this paper",
-    "title of the paper",
-    "title of this document",
-    "name of this paper",
-    "name of the paper",
-}
-
-
-def is_author_question(q):
-    return normalize(q) in AUTHOR_QUERIES
-
-
-def is_title_question(q):
-    return normalize(q) in TITLE_QUERIES
 
 def get_document_record(doc_id, db_path="chunks.db"):
     conn = sqlite3.connect(db_path)
@@ -85,26 +54,30 @@ def handle_query(question, doc_id, n_results=3, conversation_id=None, db_path="c
         print(f"No document found for doc_id={doc_id}.")
         return None
 
-
-
     conversation_id = _resolve_conversation(conversation_id, doc_id, db_path=db_path)
 
     convo_state = get_conversation(conversation_id, db_path=db_path)
     rolling_summary = convo_state.get("rolling_summary") if convo_state else None
     recent_messages = convo_state.get("messages", []) if convo_state else []
 
+    question_lower = question.lower()
+
+    is_shortcut = False
     answer_text = None
     sources = []
     source_type = "document"
 
-    if is_author_question(question):
+    if any(word in question_lower for word in ["author", "wrote", "written", "writer"]):
+        is_shortcut = True
         authors = record.get("authors") or []
         answer_text = ", ".join(authors) if authors else "Unknown"
         print("Authors:", answer_text)
 
-    elif is_title_question(question):
+    elif any(word in question_lower for word in ["title", "name"]):
+        is_shortcut = True
         answer_text = record.get("title") or "Unknown"
         print("Title:", answer_text)
+
     else:
         try:
             result = generate_answer(
@@ -147,7 +120,7 @@ def handle_query(question, doc_id, n_results=3, conversation_id=None, db_path="c
         print(f"Warning: failed to save conversation: {e}")
 
     try:
-        update_rolling_summary(conversation_id, _ollama, doc_title=record.get("title", ""), db_path=db_path)
+        update_rolling_summary(conversation_id, llm, doc_title=record.get("title", ""), db_path=db_path)
     except Exception as e:
         print(f"Warning: failed to update rolling summary: {e}")
 
