@@ -2,7 +2,6 @@ import re
 import pymupdf
 import pdfplumber
 import json
-import os
 import hashlib
 import pytesseract
 import io
@@ -249,7 +248,7 @@ def query_chroma(query_text, collection, n_results=5, chunk_type=None, doc_id=No
         results["metadatas"][0],
         results["distances"][0],
     ):
-        hits.append({"text": doc, "meta": meta, "score": 1 - dist})  
+        hits.append({"text": doc, "meta": meta, "score": 1 - dist})  # cosine → similarity
 
     return hits
 
@@ -1025,7 +1024,7 @@ def _bboxes_overlap(b1, b2, tolerance=20):
     y_overlap = max(0, min(b1[3], b2[3]) - max(b1[1], b2[1]))
     y_range = max(b1[3] - b1[1], b2[3] - b2[1], 1)
     if y_overlap / y_range > 0.5:
-       
+        # Also check horizontal overlap
         x_overlap = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
         x_range = max(b1[2] - b1[0], b2[2] - b2[0], 1)
         if x_overlap / x_range > 0.3:
