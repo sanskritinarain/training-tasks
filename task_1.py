@@ -13,43 +13,28 @@ from PIL import Image
 import chromadb
 from sentence_transformers import SentenceTransformer
 import sqlite3
+import requests
 import os
 from groq import Groq
 from dotenv import load_dotenv
-
 load_dotenv()
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
-_groq_client = None
+
+GROQ_MODEL = "llama-3.3-70b-versatile"   
+_groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+SHORT_DOC_LIMIT = 6000
 
 
-def _get_groq_client():
-    global _groq_client
-
-    if _groq_client is None:
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "GROQ_API_KEY environment variable is not set."
-            )
-
-        _groq_client = Groq(api_key=api_key)
-
-    return _groq_client
-
-
-def llm(prompt: str, model: str = None) -> str:
+def _ollama(prompt: str, model: str = None) -> str:
+    """Kept the name `_ollama` so rag_agent.py doesn't need any other changes."""
     try:
-        client = _get_groq_client()
-
-        resp = client.chat.completions.create(
-            model=model or GROQ_MODEL,
+        resp = _groq_client.chat.completions.create(
+            model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=500,
         )
         return resp.choices[0].message.content.strip()
-
     except Exception as e:
         print(f"Groq error: {e}")
         return ""
@@ -86,7 +71,7 @@ Document:
 {text}
 
 JSON:"""
-    raw = llm(prompt)
+    raw = _ollama(prompt)
     return _parse_summary_json(raw)
 
 
@@ -99,7 +84,7 @@ Section:
 {chunk_text}
 
 Summary:"""
-    return llm(prompt)
+    return _ollama(prompt)
 
 
 def _summarize_reduce(partial_summaries: list[str], title: str = "") -> dict:
@@ -118,7 +103,7 @@ def _summarize_reduce(partial_summaries: list[str], title: str = "") -> dict:
 
 Combined Summary:"""
             print(f"  Batch reducing {i//BATCH_SIZE + 1}...")
-            result = llm(prompt)
+            result = _ollama(prompt)
             if result:
                 batched.append(result)
         partial_summaries = batched
@@ -140,7 +125,7 @@ Section Summaries:
 {combined}
 
 JSON:"""
-    raw = llm(prompt)
+    raw = _ollama(prompt)
     return _parse_summary_json(raw)
 
     
@@ -170,7 +155,7 @@ _embedder = None
 def get_embedder():
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")  # fast, 384-dim
     return _embedder
 
 
@@ -279,33 +264,17 @@ def store_document_record(doc_id, doc_name, title, authors, page_count,
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
     cursor.execute("""
-INSERT INTO documents (
+INSERT OR REPLACE INTO documents (
     doc_id, doc_name, title, authors, page_count,
     word_count, chunk_count, table_count, figure_count, summary
-)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(doc_id) DO UPDATE SET
-    doc_name = excluded.doc_name,
-    title = excluded.title,
-    authors = excluded.authors,
-    page_count = excluded.page_count,
-    word_count = excluded.word_count,
-    chunk_count = excluded.chunk_count,
-    table_count = excluded.table_count,
-    figure_count = excluded.figure_count,
-    summary = excluded.summary;
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """, (
-    doc_id,
-    doc_name,
-    title,
-    json.dumps(authors),
-    page_count,
-    word_count,
-    chunk_count,
-    table_count,
-    figure_count,
-    json.dumps(summary),
-))
+        doc_id, doc_name, title,
+        json.dumps(authors),  
+        page_count, word_count, chunk_count,
+        table_count, figure_count,
+        json.dumps(summary)    
+    ))
     conn.commit()
     conn.close()
 
@@ -362,7 +331,6 @@ INSERT OR REPLACE INTO chunks (
         ))
 
     conn.commit()
-    conn.close()
     
 # SCAN OR DIGITAL
 
@@ -437,7 +405,6 @@ def normalize_for_comparison(text):
     return t
 
 
-# TITLE CASE DETECTION
 def _is_title_case(text):
     words = text.split()
     if not words:
@@ -473,7 +440,6 @@ def _classify_heading_level(text):
     return "minor"
 
 
-# sECTION HEADING DETECTION
 def is_likely_heading(text, line_size, body_size, is_bold):
     if not text or len(text.split()) > 8:
         return False
