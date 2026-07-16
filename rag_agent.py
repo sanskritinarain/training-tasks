@@ -223,7 +223,7 @@ def generate_web_answer(question, web_results):
 
     context = build_web_context(web_results)
     prompt = WEB_PROMPT_TEMPLATE.format(question=question, context=context)
-    raw = task_1.groq(prompt).strip()
+    raw = task_1.llm(prompt).strip()
     if not raw or "NOT_IN_CONTEXT" in raw:
         return {
             "answer": WEB_NOT_FOUND_MSG,
