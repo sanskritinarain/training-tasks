@@ -275,12 +275,20 @@ def answer_question(question, doc_id, k=K_DEFAULT, rolling_summary=None, recent_
     if not hits:
         return _web_fallback(search_question)
 
-    confidence = hits[0]["score"]
+    # Compute retrieval confidence
+    top_hits = hits[:3]
+    top_confidence = hits[0]["score"]
+    avg_confidence = sum(h["score"] for h in top_hits) / len(top_hits)
 
-    if hits[0]["score"] < MIN_CONFIDENCE:
+    # Report average confidence
+    confidence = avg_confidence
+
+    # Use both top hit and average for gating
+    if top_confidence < MIN_CONFIDENCE or avg_confidence < MIN_CONFIDENCE:
         return _web_fallback(search_question)
 
     context = build_context(hits)
+
     prompt = PROMPT_TEMPLATE.format(question=search_question, context=context)
     raw = task_1.llm(prompt).strip()
 
