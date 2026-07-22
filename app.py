@@ -3,18 +3,20 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from pydantic import BaseModel
 from task_1 import main as process_document
 from conversation_store import create_conversation
-from token_utils import verify_chat_token, create_chat_token
 from query import handle_query
 import jwt
 import sqlite3
 import os
 from token_utils import verify_chat_token, create_chat_token, decode_expired_token
-from fastapi import Depends, HTTPException
+from fastapi import Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from task_1 import init_documents_table
+from fastapi.concurrency import run_in_threadpool
 
 
 app = FastAPI()
 
+init_documents_table()
 
 def init_sessions_table():
     conn = sqlite3.connect("chunks.db")
@@ -30,22 +32,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     conn.close()
 
 
-init_sessions_table()
-
 UPLOAD_DIR = "uploaded_docs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# Initialize db
-conn = sqlite3.connect("chunks.db")
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS documents (
-        doc_id TEXT PRIMARY KEY,
-        doc_name TEXT
-    )
-""")
-conn.commit()
-conn.close()
+init_sessions_table()
 
 
 @app.get("/")
@@ -56,23 +45,27 @@ def health_check():
 # 1st API (NEW DOC UPLOAD)
 @app.post("/uploadDocument")
 async def upload_document(file: UploadFile = File(...)):
+    filename = os.path.basename(file.filename)
+
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
     contents = await file.read()
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    file_path = os.path.join(UPLOAD_DIR, filename)
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    result = process_document(file_path)
+    result = await run_in_threadpool(process_document, file_path)
 
     if result is None:
         return {"error": "Failed to process document"}
 
     return {
         "doc_id": result["doc_id"],
-        "filename": file.filename,
+        "filename": filename,
         "message": "Document uploaded and processed successfully"
     }
-
 
 # 2nd API (FETCH UPLOADED DOCS ID)
 @app.get("/getAllUploadedDocuments")
