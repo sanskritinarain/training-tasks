@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from pydantic import BaseModel
 from task_1 import main as process_document
@@ -7,14 +7,29 @@ from query import handle_query
 import jwt
 import sqlite3
 import os
-from token_utils import verify_chat_token, create_chat_token, decode_expired_token
+from token_utils import verify_chat_token, create_chat_token, decode_expired_token, TOKEN_EXPIRE_MINUTES, MAX_REFRESH_AGE_HOURS
 from fastapi import Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from task_1 import init_documents_table
 from fastapi.concurrency import run_in_threadpool
-
+import secrets
 
 app = FastAPI()
+
+DOCUMENTS_API_KEY = os.getenv("DOCUMENTS_API_KEY")
+
+if not DOCUMENTS_API_KEY:
+    raise RuntimeError("DOCUMENTS_API_KEY environment variable is required")
+
+
+def require_api_key(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    if not x_api_key or not secrets.compare_digest(x_api_key, DOCUMENTS_API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+        )
 
 init_documents_table()
 
@@ -92,9 +107,11 @@ def get_document_record(doc_id: str):
         return None
     return {"doc_id": row[0], "doc_name": row[1]}
 
-
 @app.get("/document/{doc_id}")
-def get_document(doc_id: str):
+def get_document(
+    doc_id: str,
+    _: None = Depends(require_api_key),
+):
     document = get_document_record(doc_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -105,19 +122,15 @@ def get_document(doc_id: str):
         "doc_id": document["doc_id"],
         "doc_name": document["doc_name"],
         "chat_token": token,
-        "expires_in": 3600
+        "expires_in": TOKEN_EXPIRE_MINUTES * 60,
     }
-
-
-SESSION_TIMEOUT_MINUTES = 30
 
 
 # 4TH API (START OR CONTINUE CHAT SESSION)
 security = HTTPBearer()
-
 @app.post("/initiateChat")
 def initiate_chat(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials  
+    token = credentials.credentials
 
     try:
         payload = verify_chat_token(token)
@@ -127,46 +140,23 @@ def initiate_chat(credentials: HTTPAuthorizationCredentials = Depends(security))
         raise HTTPException(status_code=401, detail="Invalid token")
 
     doc_id = payload["doc_id"]
-
-    conn = sqlite3.connect("chunks.db")
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT session_id, last_active_at FROM sessions WHERE doc_id = ? ORDER BY last_active_at DESC LIMIT 1",
-        (doc_id,)
-    )
-    row = cursor.fetchone()
-
-    now = datetime.utcnow()
-
-    if row is not None:
-        existing_session_id, last_active_str = row
-        last_active = datetime.fromisoformat(last_active_str)
-
-        if now - last_active < timedelta(minutes=SESSION_TIMEOUT_MINUTES):
-            cursor.execute(
-                "UPDATE sessions SET last_active_at = ? WHERE session_id = ?",
-                (now.isoformat(), existing_session_id)
-            )
-            conn.commit()
-            conn.close()
-            return {"session_id": existing_session_id, "status": "continued"}
-
-    conn.close()
+    now = datetime.now(timezone.utc)
 
     new_session_id = create_conversation(doc_id, db_path="chunks.db")
 
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO sessions (session_id, doc_id, last_active_at) VALUES (?, ?, ?)",
-        (new_session_id, doc_id, now.isoformat())
+        """
+        INSERT INTO sessions (session_id, doc_id, last_active_at)
+        VALUES (?, ?, ?)
+        """,
+        (new_session_id, doc_id, now.isoformat()),
     )
     conn.commit()
     conn.close()
 
     return {"session_id": new_session_id, "status": "created"}
-
 
 # 5TH API (SEND CHAT MESSAGE)
 class ChatRequest(BaseModel):
@@ -205,14 +195,19 @@ def send_chat(request: ChatRequest, credentials: HTTPAuthorizationCredentials = 
         conversation_id=request.session_id,
     )
 
-    if result is None:
-        raise HTTPException(status_code=404, detail="Document or conversation not found")
+    if not result["ok"]:
+        error = result["error"]
+
+        if error["code"] == "document_not_found":
+            raise HTTPException(status_code=404, detail=error["message"])
+
+        raise HTTPException(status_code=500, detail=error["message"])
 
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE sessions SET last_active_at = ? WHERE session_id = ?",
-        (datetime.utcnow().isoformat(), request.session_id)
+        (datetime.now(timezone.utc).isoformat(), request.session_id),
     )
     conn.commit()
     conn.close()
@@ -224,7 +219,6 @@ def send_chat(request: ChatRequest, credentials: HTTPAuthorizationCredentials = 
         "source_type": result["source_type"],
     }
 
-
 # 6TH API (REFRESH EXPIRED TOKEN)
 @app.post("/refreshToken")
 def refresh_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -235,16 +229,29 @@ def refresh_token(credentials: HTTPAuthorizationCredentials = Depends(security))
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    refresh_expires_at = payload.get("refresh_expires_at")
+
+    if (
+        not isinstance(refresh_expires_at, int)
+        or datetime.now(timezone.utc).timestamp() >= refresh_expires_at
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Token refresh period has expired. Request a new chat token.",
+        )
+
     doc_id = payload["doc_id"]
 
-    document = get_document_record(doc_id)
-    if document is None:
+    if get_document_record(doc_id) is None:
         raise HTTPException(status_code=404, detail="Document not found")
-
-    new_token = create_chat_token(doc_id)
+    
+    new_token = create_chat_token(
+        doc_id,
+        refresh_expires_at=refresh_expires_at,
+    )
 
     return {
         "doc_id": doc_id,
         "chat_token": new_token,
-        "expires_in": 3600
+        "expires_in": TOKEN_EXPIRE_MINUTES * 60,
     }
