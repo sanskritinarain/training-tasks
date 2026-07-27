@@ -1,3 +1,4 @@
+
 import ast
 import sys
 
@@ -8,6 +9,8 @@ FILES_TO_CHECK = [
     "web_search.py",
     "conversation_store.py",
     "handoff.py",
+    "app.py",
+    "token_utils.py",
 ]
 
 def main():
