@@ -40,7 +40,7 @@ def init_sessions_table():
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     doc_id TEXT,
-    last_active_at TEXT
+
 )
 """)
     conn.commit()
@@ -147,7 +147,7 @@ def initiate_chat(credentials: HTTPAuthorizationCredentials = Depends(security))
         raise HTTPException(status_code=401, detail="Invalid token")
 
     doc_id = payload["doc_id"]
-    now = datetime.now(timezone.utc)
+   
 
     new_session_id = create_conversation(doc_id, db_path="chunks.db")
 
@@ -158,7 +158,7 @@ def initiate_chat(credentials: HTTPAuthorizationCredentials = Depends(security))
         INSERT INTO sessions (session_id, doc_id, last_active_at)
         VALUES (?, ?, ?)
         """,
-        (new_session_id, doc_id, now.isoformat()),
+        (new_session_id, doc_id),
     )
     conn.commit()
     conn.close()
@@ -210,14 +210,7 @@ def send_chat(request: ChatRequest, credentials: HTTPAuthorizationCredentials = 
 
         raise HTTPException(status_code=500, detail=error["message"])
 
-    conn = sqlite3.connect("chunks.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE sessions SET last_active_at = ? WHERE session_id = ?",
-        (datetime.now(timezone.utc).isoformat(), request.session_id),
-    )
-    conn.commit()
-    conn.close()
+
 
     return {
         "session_id": result["conversation_id"],
