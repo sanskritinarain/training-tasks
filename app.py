@@ -58,8 +58,12 @@ def health_check():
 
 
 # 1st API (NEW DOC UPLOAD)
+
 @app.post("/uploadDocument")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    _: None = Depends(require_api_key),
+):
     filename = os.path.basename(file.filename)
 
     if not filename.lower().endswith(".pdf"):
@@ -79,12 +83,15 @@ async def upload_document(file: UploadFile = File(...)):
     return {
         "doc_id": result["doc_id"],
         "filename": filename,
-        "message": "Document uploaded and processed successfully"
+        "message": "Document uploaded and processed successfully",
     }
 
 # 2nd API (FETCH UPLOADED DOCS ID)
+
 @app.get("/getAllUploadedDocuments")
-def get_all_uploaded_documents():
+def get_all_uploaded_documents(
+    _: None = Depends(require_api_key),
+):
     conn = sqlite3.connect("chunks.db")
     cursor = conn.cursor()
     cursor.execute("SELECT doc_id, doc_name FROM documents")
