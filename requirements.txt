@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+PyJWT
+python-dotenv
+PyMuPDF
+pdfplumber
+pytesseract
+Pillow
+chromadb
+sentence-transformers
+groq
+tavily-python
+networkx
