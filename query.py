@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import re
 import sqlite3
 
 from rag_agent import answer_question as generate_answer
@@ -13,6 +14,39 @@ from conversation_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def normalize(q):
+    return re.sub(r"[^\w\s]", "", q.lower()).strip()
+
+
+AUTHOR_QUERIES = {
+    "who wrote this",
+    "who wrote the paper",
+    "who is the author",
+    "who are the authors",
+    "author of this paper",
+    "author of the paper",
+}
+
+
+TITLE_QUERIES = {
+    "what is the title",
+    "whats the title",
+    "title of this paper",
+    "title of the paper",
+    "title of this document",
+    "name of this paper",
+    "name of the paper",
+}
+
+
+def is_author_question(q):
+    return normalize(q) in AUTHOR_QUERIES
+
+
+def is_title_question(q):
+    return normalize(q) in TITLE_QUERIES
 
 
 def _error(code: str, message: str):
@@ -140,19 +174,15 @@ def handle_query(
             "Unable to load the chat session",
         )
 
-    question_lower = question.lower()
     answer_text = None
     sources = []
     source_type = "document"
 
-    if any(
-        word in question_lower
-        for word in ["author", "wrote", "written", "writer"]
-    ):
+    if is_author_question(question):
         authors = record.get("authors") or []
         answer_text = ", ".join(authors) if authors else "Unknown"
 
-    elif any(word in question_lower for word in ["title", "name"]):
+    elif is_title_question(question):
         answer_text = record.get("title") or "Unknown"
 
     else:
