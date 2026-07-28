@@ -10,11 +10,21 @@ import os
 from token_utils import verify_chat_token, create_chat_token, decode_expired_token, TOKEN_EXPIRE_MINUTES, MAX_REFRESH_AGE_HOURS
 from fastapi import Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, UploadFile, File, Header  
+from fastapi.middleware.cors import CORSMiddleware
 from task_1 import init_documents_table
 from fastapi.concurrency import run_in_threadpool
 import secrets
 
 app = FastAPI()
+
+app.add_middleware(                                       
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DOCUMENTS_API_KEY = os.getenv("DOCUMENTS_API_KEY")
 
